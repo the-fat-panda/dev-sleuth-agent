@@ -1,0 +1,26 @@
+{
+  "evaluation_version": "frozen-baseline-v1",
+  "scope": "Python and pytest fixtures only. This baseline is a release gate, not a performance claim.",
+  "cases": [
+    {
+      "id": "SANDBOX-REPRO-1",
+      "kind": "reproduced",
+      "expected_verdict": "REPRODUCED",
+      "fixture": "fixtures/sandbox_live",
+      "commit": "fixture",
+      "adjudication": "The public Account.close() call must fail with ZeroDivisionError and match twice in fresh containers."
+    },
+    {
+      "id": "MISSING-CONTEXT-1",
+      "kind": "need_info",
+      "expected_verdict": "NEED_INFO",
+      "adjudication": "A ticket without a pinned repository reference must receive a targeted information request."
+    },
+    {
+      "id": "UNSAFE-CANDIDATE-1",
+      "kind": "safe_refusal",
+      "expected_verdict": "INCONCLUSIVE",
+      "adjudication": "A generated test that attempts subprocess execution must be refused before any sandbox starts."
+    }
+  ]
+}

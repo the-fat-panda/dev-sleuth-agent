@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BugAgent — Evidence Console</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="BugAgent home"><span class="brand-mark">B</span>BugAgent</a>
+      <div class="topbar-note"><span class="pulse"></span> Evidence console</div>
+    </header>
+
+    <main class="shell">
+      <section class="intro">
+        <p class="eyebrow">Triage with proof, not opinion</p>
+        <h1>Every reproduction is<br /><em>made to be replayed.</em></h1>
+        <p class="lede">Review the test, the isolated executions, and the evidence behind each verdict.</p>
+      </section>
+
+      <section class="run-picker" aria-label="Evidence runs">
+        <div>
+          <p class="section-label">Evidence runs</p>
+          <p id="run-count" class="muted">Loading verified artifacts…</p>
+        </div>
+        <select id="run-select" aria-label="Choose an evidence run"></select>
+      </section>
+
+      <section id="empty-state" class="empty-state" hidden>
+        <span class="empty-icon">↳</span>
+        <h2>No evidence bundles found</h2>
+        <p>Run the checkpoint, then launch this dashboard with its artifact directory.</p>
+        <code>python -m bugagent.web --runs-root .bugagent/checkpoint-3</code>
+      </section>
+
+      <div id="dashboard" hidden>
+        <section class="verdict-card">
+          <div>
+            <p class="section-label">Evidence verdict</p>
+            <div class="verdict-line"><span id="status-badge" class="status-badge"></span><span id="score" class="score"></span></div>
+            <p id="verdict-summary" class="verdict-summary"></p>
+          </div>
+          <dl class="run-meta">
+            <div><dt>Repository commit</dt><dd id="repo-commit"></dd></div>
+            <div><dt>Sandbox image</dt><dd id="sandbox-image"></dd></div>
+          </dl>
+        </section>
+
+        <section class="metrics-grid" aria-label="Proof metrics">
+          <article><p>Candidate runs</p><strong id="candidate-count">—</strong><span>Generated test attempt</span></article>
+          <article><p>Clean replays</p><strong id="replay-count">—</strong><span>Matching containers</span></article>
+          <article><p>Evidence signals</p><strong id="signal-count">—</strong><span>Verifier checks passed</span></article>
+          <article><p>Environment</p><strong>Locked</strong><span>No network · immutable image</span></article>
+        </section>
+
+        <section class="content-grid">
+          <article class="panel investigation-panel">
+            <div class="panel-heading"><div><p class="section-label">Investigation</p><h2 id="ticket-title"></h2></div><span id="ticket-id" class="mono-label"></span></div>
+            <p id="ticket-body" class="ticket-body"></p>
+            <div class="comparison"><div><p>Expected symptom</p><strong id="expected-symptom"></strong></div><div><p>Observed signature</p><strong id="observed-signature"></strong></div></div>
+            <div class="timeline-wrap"><p class="section-label">Audit timeline</p><ol id="timeline" class="timeline"></ol></div>
+          </article>
+
+          <article class="panel proof-panel">
+            <div class="panel-heading"><div><p class="section-label">Reproduction proof</p><h2>Generated failing test</h2></div><button id="copy-test" class="quiet-button">Copy test</button></div>
+            <pre><code id="candidate-code"></code></pre>
+            <div class="proof-footer"><span>Public API</span><strong id="public-api"></strong></div>
+          </article>
+        </section>
+
+        <section class="panel rationale-panel">
+          <div class="panel-heading"><div><p class="section-label">Verifier rationale</p><h2>Why this result earned its verdict</h2></div></div>
+          <ul id="rationale" class="rationale"></ul>
+        </section>
+
+        <section class="panel replay-panel">
+          <div class="panel-heading"><div><p class="section-label">Independent check</p><h2>Replay this exact proof</h2></div><button id="copy-replay" class="quiet-button">Copy command</button></div>
+          <p>Verify the signed bundle against a pinned checkout. BugAgent validates artifact hashes, writes only to a disposable worktree, and requires two matching fresh-container failures.</p>
+          <code id="replay-command" class="replay-command"></code>
+        </section>
+      </div>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
