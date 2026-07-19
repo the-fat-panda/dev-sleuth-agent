@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f6f7f9" />
+    <title>DevSleuthAgent — Investigation workspace</title>
+    <link rel="stylesheet" href="/app/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <a class="brand" href="#new" aria-label="DevSleuthAgent home">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span>DevSleuthAgent</span>
+      </a>
+      <nav class="app-nav" aria-label="Workspace navigation">
+        <button class="nav-link is-active" type="button" data-view-target="submit">New investigation</button>
+        <button class="nav-link" type="button" data-view-target="history">History</button>
+      </nav>
+    </header>
+
+    <main class="app-shell">
+      <section id="screen-submit" class="screen" aria-labelledby="submit-title">
+        <div class="screen-heading narrow-heading">
+          <p class="eyebrow">Evidence-first investigation</p>
+          <h1 id="submit-title">Turn a reported failure into proof.</h1>
+          <p>Describe the issue in the same terms a customer would use. DevSleuthAgent writes a focused regression test, runs it in a restricted sandbox, then independently replays the result.</p>
+        </div>
+
+        <form id="investigation-form" class="submission-card" novalidate>
+          <div class="field-grid">
+            <label class="field field-wide" for="ticket-title">
+              <span>What is happening?</span>
+              <input id="ticket-title" name="title" type="text" autocomplete="off" required placeholder="For example: Closing a new record fails" />
+            </label>
+            <label class="field field-wide" for="ticket-body">
+              <span>What did the person experience?</span>
+              <textarea id="ticket-body" name="body" rows="6" required placeholder="Describe what they tried, what happened, and any useful context. Keep it in plain language."></textarea>
+            </label>
+            <label class="field" for="expected-error">
+              <span>Expected error <em>Optional</em></span>
+              <input id="expected-error" name="expected-error" type="text" autocomplete="off" placeholder="For example: ValueError" />
+            </label>
+            <label class="field" for="repository-kind">
+              <span>Repository source</span>
+              <select id="repository-kind" name="repository-kind">
+                <option value="github">GitHub repository</option>
+                <option value="local_path">Local folder</option>
+              </select>
+            </label>
+            <label class="field" data-source-kind="github" for="github-repository">
+              <span>GitHub repository</span>
+              <input id="github-repository" name="github-repository" type="text" autocomplete="off" required placeholder="owner/repository" />
+            </label>
+            <label class="field" data-source-kind="github" for="github-ref">
+              <span>Branch or tag</span>
+              <input id="github-ref" name="github-ref" type="text" autocomplete="off" required placeholder="backend-main" />
+            </label>
+            <label class="field" data-source-kind="local_path" for="repository-path" hidden>
+              <span>Repository folder</span>
+              <input id="repository-path" name="repository-path" type="text" autocomplete="off" disabled placeholder="C:\work\project" />
+            </label>
+            <label class="field" data-source-kind="local_path" for="commit-label" hidden>
+              <span>Commit label</span>
+              <input id="commit-label" name="commit-label" type="text" autocomplete="off" disabled placeholder="A commit SHA or stable label" />
+            </label>
+          </div>
+          <div class="form-footer">
+            <p id="form-message" class="form-message" role="alert" aria-live="polite"></p>
+            <button id="run-button" class="primary-button" type="submit">Run investigation</button>
+          </div>
+        </form>
+      </section>
+
+      <section id="screen-live" class="screen" aria-labelledby="live-title" hidden>
+        <div class="live-header">
+          <div>
+            <p class="eyebrow">Live investigation</p>
+            <h1 id="live-title">Investigating your report</h1>
+            <p id="live-ticket-title" class="muted-copy"></p>
+          </div>
+          <div class="elapsed-card" aria-label="Elapsed time">
+            <span>Elapsed time</span>
+            <strong id="elapsed-time">00:00</strong>
+          </div>
+        </div>
+
+        <section class="live-proof-card" aria-label="Investigation progress">
+          <div class="live-status-line">
+            <span id="live-status-dot" class="status-dot is-running" aria-hidden="true"></span>
+            <p id="live-status-message" aria-live="polite">Preparing the investigation</p>
+          </div>
+          <ol id="stage-list" class="stage-list">
+            <li class="stage" data-stage="github_checkout">
+              <span class="stage-marker" aria-hidden="true"></span>
+              <div><strong>Pinning repository</strong><span>Cloning the selected GitHub ref into a disposable checkout</span></div>
+              <small>Waiting</small>
+            </li>
+            <li class="stage" data-stage="form_hypothesis">
+              <span class="stage-marker" aria-hidden="true"></span>
+              <div><strong>Forming hypothesis</strong><span>Reading the report and safe repository context</span></div>
+              <small>Waiting</small>
+            </li>
+            <li class="stage" data-stage="candidate_sandbox">
+              <span class="stage-marker" aria-hidden="true"></span>
+              <div><strong>Running candidate in sandbox</strong><span>Collecting and executing the generated regression test</span></div>
+              <small>Waiting</small>
+            </li>
+            <li class="stage" data-stage="replay_1">
+              <span class="stage-marker" aria-hidden="true"></span>
+              <div><strong>Replaying in a fresh sandbox</strong><span>Checking the same signal independently</span></div>
+              <small>Waiting</small>
+            </li>
+            <li class="stage" data-stage="replay_2">
+              <span class="stage-marker" aria-hidden="true"></span>
+              <div><strong>Confirming the replay</strong><span>Requiring a second matching execution</span></div>
+              <small>Waiting</small>
+            </li>
+            <li class="stage" data-stage="verdict">
+              <span class="stage-marker" aria-hidden="true"></span>
+              <div><strong>Producing verdict</strong><span>Signing the evidence bundle and assessing the proof</span></div>
+              <small>Waiting</small>
+            </li>
+          </ol>
+          <div id="live-error" class="inline-error" role="alert" hidden></div>
+          <div id="live-actions" class="live-actions" hidden>
+            <button id="open-proof" class="primary-button" type="button">Open evidence</button>
+            <button class="secondary-button" type="button" data-view-target="submit">Start another investigation</button>
+          </div>
+        </section>
+      </section>
+
+      <section id="screen-evidence" class="screen" aria-labelledby="evidence-title" hidden>
+        <div class="evidence-toolbar">
+          <button class="back-button" type="button" data-view-target="history">Back to history</button>
+          <button class="secondary-button" type="button" data-view-target="submit">New investigation</button>
+        </div>
+        <section id="verdict-hero" class="verdict-hero" aria-labelledby="evidence-title">
+          <div>
+            <p class="eyebrow">Evidence verdict</p>
+            <h1 id="evidence-title">Loading evidence</h1>
+            <p id="verdict-summary" class="verdict-summary"></p>
+          </div>
+          <div class="score-block"><span>Evidence score</span><strong id="evidence-score">—</strong></div>
+        </section>
+
+        <section class="run-summary" aria-label="Investigation summary">
+          <div><span>Ticket</span><strong id="evidence-ticket-title">—</strong></div>
+          <div><span>Run ID</span><strong id="evidence-run-id" class="mono-text">—</strong></div>
+          <div><span>Repository commit</span><strong id="evidence-commit" class="mono-text">—</strong></div>
+        </section>
+
+        <section class="evidence-details" aria-label="Evidence details">
+          <details>
+            <summary>Generated regression test</summary>
+            <div class="detail-content"><pre><code id="candidate-test">No generated test is available.</code></pre></div>
+          </details>
+          <details>
+            <summary>Sandbox result</summary>
+            <div class="detail-content"><pre><code id="sandbox-result">No sandbox output is available.</code></pre></div>
+          </details>
+          <details>
+            <summary>Independent replays</summary>
+            <div class="detail-content"><pre><code id="replay-result">No replay results are available.</code></pre></div>
+          </details>
+          <details>
+            <summary>Score breakdown</summary>
+            <div class="detail-content"><ul id="score-breakdown" class="score-breakdown"></ul></div>
+          </details>
+        </section>
+      </section>
+
+      <section id="screen-history" class="screen" aria-labelledby="history-title" hidden>
+        <div class="history-heading">
+          <div>
+            <p class="eyebrow">Evidence archive</p>
+            <h1 id="history-title">Past investigations</h1>
+            <p>Each result is an immutable evidence bundle. Open one to review its proof.</p>
+          </div>
+          <button class="primary-button" type="button" data-view-target="submit">Run investigation</button>
+        </div>
+        <div id="history-loading" class="quiet-state">Loading investigations</div>
+        <div id="history-empty" class="empty-state" hidden>
+          <h2>No investigations yet</h2>
+          <p>Run an investigation to create the first evidence bundle.</p>
+          <button class="secondary-button" type="button" data-view-target="submit">Start an investigation</button>
+        </div>
+        <div id="history-error" class="inline-error" role="alert" hidden></div>
+        <div id="history-list" class="history-list" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <div id="app-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+    <script src="/app/app.js"></script>
+  </body>
+</html>

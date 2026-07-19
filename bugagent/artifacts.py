@@ -15,17 +15,18 @@ from uuid import UUID, uuid4
 from .domain import RunBundle
 
 
-def _primitive(value: Any) -> Any:
+def primitive(value: Any) -> Any:
+    """Convert domain records into JSON-safe primitives for artifacts and API responses."""
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, (datetime, UUID)):
         return value.isoformat()
     if is_dataclass(value):
-        return _primitive(asdict(value))
+        return primitive(asdict(value))
     if isinstance(value, dict):
-        return {str(key): _primitive(item) for key, item in value.items()}
+        return {str(key): primitive(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_primitive(item) for item in value]
+        return [primitive(item) for item in value]
     return value
 
 
@@ -69,7 +70,7 @@ class ArtifactStore:
     @staticmethod
     def _write_json(path: Path, value: Any) -> None:
         path.write_text(
-            json.dumps(_primitive(value), indent=2, sort_keys=True) + "\n",
+            json.dumps(primitive(value), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
 
@@ -77,7 +78,7 @@ class ArtifactStore:
     def _write_ndjson(path: Path, events: tuple[Any, ...]) -> None:
         with path.open("w", encoding="utf-8", newline="\n") as stream:
             for event in events:
-                stream.write(json.dumps(_primitive(event), sort_keys=True) + "\n")
+                stream.write(json.dumps(primitive(event), sort_keys=True) + "\n")
 
     @staticmethod
     def _hash_artifacts(directory: Path) -> dict[str, str]:

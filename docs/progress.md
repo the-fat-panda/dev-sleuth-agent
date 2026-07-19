@@ -20,14 +20,17 @@ BugAgent's intended end-to-end behavior is:
 | Evidence scoring and artifact bundles | Done | Deterministic verdict rubric, immutable run bundles, SHA-256 manifest. |
 | Independent replay | Done | Verifies bundle hashes and reruns the candidate twice in a disposable copy. |
 | Evidence dashboard | Done for local review | Local read-only web console over stored bundles. |
+| HTTP investigation API | Done as an in-process service | FastAPI starts a real investigation in a worker thread, exposes job polling, and reads completed bundles through `RunStore`. |
+| Investigation web workspace | Done as a local API client | Responsive submit, live SSE progress, collapsible evidence, and history views served at `/app/`. |
 | Frozen release gate | Done, intentionally small | Three controls: reproduction, missing input, unsafe candidate refusal. |
-| Jira notification intake | Not started | No webhook endpoint, Jira credentials, event validation, or issue lookup. |
-| Jira comments | Not started | No Jira REST client or rendered result-comment templates. |
-| Repository selection from Jira | Not started | No project-to-repository mapping or pinned-commit resolver. |
+| Jira notification intake | Foundation built, not live-configured | Signed `jira:issue_created` webhook endpoint, payload parser, in-process delivery de-duplication, and project-source lookup. |
+| Jira comments | Foundation built, not live-configured | Jira Cloud REST v3 client posts a structured ADF evidence comment after a completed verdict. |
+| GitHub repository checkout | Done and live-verified | An allow-listed GitHub source is cloned in the background to a disposable checkout, and `backend-main` on `the-fat-panda/e-commerce` resolved to commit `7adbe54…`. |
+| Repository selection from Jira | GitHub mapping built | `BUGAGENT_JIRA_PROJECT_SOURCES` maps a project key to either a local checkout or an allow-listed GitHub repository/ref. |
 | Fix generation and validation | Not started | No patch schema, disposable patch worktree, or before/after verification gate. |
 | Pull-request creation | Not started | No Git provider client, branch, commit, or PR workflow. |
 | Jira backlink to PR | Not started | Depends on Jira comments and PR creation. |
-| Queue, retries, deployment, observability | Not started | Current runner is local and synchronous. |
+| Queue, retries, deployment, observability | Not started | The API job registry is local and in-memory; it has no durability, retry policy, deployment, or observability yet. |
 
 ## Completed checkpoints
 
@@ -44,7 +47,7 @@ BugAgent's intended end-to-end behavior is:
 
 ### Phase 6 - Jira intake and reproduction comments
 
-Build a signed Jira webhook endpoint, idempotent job record, project/repository mapping, and Jira comment renderer. The first real checkpoint is a test webhook that produces either a `REPRODUCED` evidence comment or a transparent `NEED_INFO` / `INCONCLUSIVE` comment on a test issue.
+The signed Jira webhook endpoint, in-process duplicate-delivery guard, GitHub-backed project-source mapping, and Jira comment renderer are built. The first real checkpoint is now configuration: point a test Jira project's signed `jira:issue_created` webhook at a publicly reachable HTTPS API endpoint, then verify it produces either a `REPRODUCED` evidence comment or a transparent `NEED_INFO` / `INCONCLUSIVE` comment. Durable idempotency remains pending.
 
 ### Phase 7 - Fix agent and sandbox validation
 
@@ -60,4 +63,4 @@ Add a durable queue, retry and idempotency policy, webhook signature verificatio
 
 ## What is deliberately not claimed
 
-BugAgent is not yet a Jira bot, a code-fixing agent, or a PR automation product. It currently proves the middle of that future flow: **local ticket input -> real-model sandboxed reproduction attempt -> evidence bundle -> independent replay and review**.
+DevSleuthAgent is not yet a live-configured Jira bot, a code-fixing agent, or a PR automation product. It currently proves the middle of that future flow: **local ticket input (or a signed Jira event after configuration) -> real-model sandboxed reproduction attempt -> evidence bundle -> independent replay and review**.

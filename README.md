@@ -1,6 +1,6 @@
-# BugAgent - Evidence-to-PR for bug triage
+# DevSleuthAgent - Evidence-to-PR for bug triage
 
-BugAgent turns a bug ticket into a reviewable proof bundle: a deterministic failing test, two clean-container replays, and a signed evidence trail. It is deliberately optimized for the moment a maintainer asks, "Can you prove this?"
+DevSleuthAgent turns a bug ticket into a reviewable proof bundle: a deterministic failing test, two clean-container replays, and a signed evidence trail. It is deliberately optimized for the moment a maintainer asks, "Can you prove this?"
 
 It does not award `REPRODUCED` because a model sounds confident. The verdict is gated by collection success, a repository-level failure frame, symptom matching, public-API use, and two matching clean replays.
 
@@ -68,6 +68,10 @@ Alternatively provide `--ticket-file` with a JSON object containing the `id`, `t
 
 `ResponsesInvestigationClient` uses the current Responses API with strict JSON schema output and defaults to `gpt-5.6-terra`. Set `OPENAI_API_KEY` before wiring it into a production intake surface. The offline scripted fixture keeps the judge demo repeatable without credentials.
 
+## HTTP API
+
+The optional FastAPI layer starts real investigations asynchronously from either a local source checkout or an explicit GitHub repository allow-list. It resolves GitHub branch refs to a disposable pinned checkout in a worker thread, returns a job ID immediately, exposes polling, retained Server-Sent Events, and immutable-bundle endpoints. Open `/app/` on the API server for the responsive investigation workspace: submit a report, watch the live proof stages, inspect the verdict, and reopen history. See the [HTTP API guide](docs/API.md) for environment configuration, request JSON, endpoint contracts, and known in-process limitations.
+
 ## Design and submission materials
 
 - [High-level design](docs/HLD.md)
@@ -77,3 +81,4 @@ Alternatively provide `--ticket-file` with a JSON object containing the `id`, `t
 - [Implemented workflow traces](docs/workflow.md)
 - [Evaluation protocol](docs/EVALUATION.md)
 - [Demo and submission plan](docs/SUBMISSION.md)
+- [HTTP API guide](docs/API.md)
