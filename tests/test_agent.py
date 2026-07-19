@@ -109,6 +109,7 @@ class ResponsesClientTests(unittest.TestCase):
                                 "hypothesis": "close fails",
                                 "expected_symptom": "ValueError",
                                 "public_api_claims": ["Account.close"],
+                                "silent_output": None,
                             }
                         )
                     }

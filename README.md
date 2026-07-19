@@ -2,7 +2,7 @@
 
 DevSleuthAgent turns a bug ticket into a reviewable proof bundle: a deterministic failing test, two clean-container replays, and a signed evidence trail. It is deliberately optimized for the moment a maintainer asks, "Can you prove this?"
 
-It does not award `REPRODUCED` because a model sounds confident. The verdict is gated by collection success, a repository-level failure frame, symptom matching, public-API use, and two matching clean replays.
+It does not award `REPRODUCED` because a model sounds confident. Crash reproductions require a repository-level failure frame and two matching clean replays. Silent wrong-output reproductions require a separately grounded repository contract, a deterministic expected-value oracle, a verified public-API probe, and two matching fresh observations. A model assertion alone never counts as proof.
 
 ## Judge quick start
 
@@ -33,7 +33,7 @@ Then visit `http://127.0.0.1:8765`. The dashboard shows the ticket, generated te
 
 - Bounded investigation loop with repository-context allowlists, an optional OpenAI Responses API client, and a strict candidate-test schema.
 - Sandboxed pytest execution: immutable image only, no network, read-only filesystem, unprivileged user, dropped capabilities, CPU/memory/PID limits, output cap, and execution timeout.
-- Conservative verifier: setup failures, timeouts, generated-test failures, and mismatched replays can never become a positive verdict.
+- Conservative verifier: setup failures, timeouts, and mismatched replays can never become a positive verdict. A generated-test assertion is accepted only for a verified contract-backed wrong-output proof; all other generated-test failures remain disqualified.
 - Hash-addressed artifacts: candidate, evidence, verdict, timeline, and manifest are atomically published and signed with SHA-256 hashes.
 - Independent `bugagent replay` verifier: refuses tampered bundles, never modifies the supplied checkout, and demands matching signatures from two fresh runs.
 - Judge-facing evidence console and frozen baseline controls for a positive, a `NEED_INFO` abstention, and an unsafe-test refusal.

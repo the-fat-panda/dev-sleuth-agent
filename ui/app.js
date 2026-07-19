@@ -7,10 +7,11 @@ const state = {
   eventSource: null,
   statusPoll: null,
   elapsedTimer: null,
+  activityPoll: null,
   startedAt: null,
 };
 
-const stageNames = new Set(['github_checkout', 'form_hypothesis', 'candidate_sandbox', 'replay_1', 'replay_2', 'verdict']);
+const stageNames = new Set(['github_checkout', 'form_hypothesis', 'candidate_sandbox', 'replay_1', 'replay_2', 'verdict', 'jira_comment']);
 
 async function api(url, options = {}) {
   const response = await fetch(url, options);
@@ -24,12 +25,14 @@ async function api(url, options = {}) {
 
 function showView(view) {
   if (state.activeView === 'live' && view !== 'live') stopLiveConnections();
+  if (state.activeView === 'activity' && view !== 'activity') stopActivityPolling();
   document.querySelectorAll('.screen').forEach((screen) => { screen.hidden = screen.id !== `screen-${view}`; });
   document.querySelectorAll('[data-view-target]').forEach((button) => {
     button.classList.toggle('is-active', button.dataset.viewTarget === view);
   });
   state.activeView = view;
   if (view === 'history') loadHistory();
+  if (view === 'activity') startActivityPolling();
   window.scrollTo({ top: 0, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
 }
 
@@ -118,9 +121,10 @@ function startLiveView(accepted, ticketTitle) {
   stopLiveConnections();
   state.job = accepted;
   state.activeRun = null;
-  state.startedAt = Date.now();
+  const startedAt = accepted.created_at ? new Date(accepted.created_at).getTime() : Number.NaN;
+  state.startedAt = Number.isNaN(startedAt) ? Date.now() : startedAt;
   resetStages();
-  dom('live-ticket-title').textContent = ticketTitle;
+  dom('live-ticket-title').textContent = accepted.issue_key ? `${accepted.issue_key} · ${ticketTitle}` : ticketTitle;
   dom('live-status-message').textContent = 'Investigation queued';
   dom('live-status-dot').className = 'status-dot is-running';
   dom('live-error').hidden = true;
@@ -219,6 +223,59 @@ function stopLiveConnections() {
   state.elapsedTimer = null;
 }
 
+function startActivityPolling() {
+  stopActivityPolling();
+  loadActivity();
+  state.activityPoll = window.setInterval(loadActivity, 3000);
+}
+
+function stopActivityPolling() {
+  if (state.activityPoll) window.clearInterval(state.activityPoll);
+  state.activityPoll = null;
+}
+
+async function loadActivity() {
+  const loading = dom('activity-loading');
+  const empty = dom('activity-empty');
+  const error = dom('activity-error');
+  const list = dom('activity-list');
+  loading.hidden = false;
+  empty.hidden = true;
+  error.hidden = true;
+  try {
+    const { jobs } = await api('/investigations?limit=25');
+    list.replaceChildren();
+    if (!jobs.length) {
+      empty.hidden = false;
+      return;
+    }
+    jobs.forEach((job) => list.append(activityRow(job)));
+  } catch (requestError) {
+    error.textContent = `Unable to load active investigations. ${requestError.message}`;
+    error.hidden = false;
+  } finally {
+    loading.hidden = true;
+  }
+}
+
+function activityRow(job) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'history-row activity-row';
+  button.innerHTML = '<span class="history-ticket"><strong></strong><span></span></span><span class="history-status"></span><span class="history-score"></span><span class="history-arrow" aria-hidden="true">›</span>';
+  const title = job.ticket?.title || job.issue_key || 'Investigation';
+  const source = job.source === 'jira' ? `Jira ${job.issue_key || job.ticket?.id || ''}` : 'Manual submission';
+  button.querySelector('.history-ticket strong').textContent = title;
+  button.querySelector('.history-ticket span').textContent = `${source} · ${formatDate(job.updated_at)}`;
+  const status = button.querySelector('.history-status');
+  status.textContent = job.status;
+  status.classList.add(`is-job-${job.status}`);
+  const detail = button.querySelector('.history-score');
+  detail.textContent = job.status === 'done' ? `${job.verdict?.score ?? '—'}/100` : job.status === 'failed' ? 'Needs review' : 'Live';
+  button.addEventListener('click', () => startLiveView(job, title));
+  return button;
+}
+
 function tickElapsed() {
   const seconds = Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000));
   const minutes = String(Math.floor(seconds / 60)).padStart(2, '0');
@@ -243,6 +300,7 @@ function renderEvidence(run) {
   dom('evidence-commit').textContent = manifest.repo_commit;
   dom('candidate-test').textContent = candidate.content || '# The investigation did not generate a candidate test.';
   dom('sandbox-result').textContent = sandboxReport(candidateEvidence);
+  dom('grounded-result').textContent = groundedReport(candidateEvidence);
   dom('replay-result').textContent = replayReport(replays);
   renderScoreBreakdown(verdict);
   document.querySelectorAll('.evidence-details details').forEach((detail) => { detail.open = false; });
@@ -251,6 +309,7 @@ function renderEvidence(run) {
 function verdictPresentation(status) {
   if (status === 'REPRODUCED') return { label: 'REPRODUCED', className: 'is-reproduced' };
   if (status === 'NEED_INFO') return { label: 'NEED INFO', className: 'is-need-info' };
+  if (status === 'INCONCLUSIVE') return { label: 'INCONCLUSIVE', className: 'is-inconclusive' };
   return { label: 'CANNOT REPRODUCE', className: 'is-not-reproduced' };
 }
 
@@ -268,6 +327,24 @@ function sandboxReport(evidence) {
     `Normalized crash: ${evidence.normalized_signature}`,
     `Repository frame: ${evidence.relevant_frame_matches ? 'confirmed' : 'not confirmed'}`,
     `Failure origin: ${evidence.failure_origin || 'not classified'}`,
+  ].join('\n');
+}
+
+function groundedReport(evidence) {
+  const proof = evidence.silent_output;
+  if (!proof) return 'This investigation did not use a contract-backed silent-output proof.';
+  const pairs = (values) => (values || []).map((value) => `${value.name}=${value.minor}`).join(', ') || '(none)';
+  const inputs = (proof.input_values || []).map((value) => `${value.name}=${value.value}`).join(', ') || '(none)';
+  return [
+    `Verified: ${proof.probe_verified ? 'yes' : 'no'}`,
+    `Policy: ${proof.policy_id}`,
+    `Repository contract: ${proof.contract_path}`,
+    `Contract hash: ${proof.contract_sha256 || 'unavailable'}`,
+    `Contract text: ${proof.contract_anchor}`,
+    `Inputs: ${inputs}`,
+    `Deterministic expected values: ${pairs(proof.expected_values)}`,
+    `Observed product values: ${pairs(proof.observed_values)}`,
+    proof.verification_error ? `Verification issue: ${proof.verification_error}` : 'Verification issue: none',
   ].join('\n');
 }
 
@@ -293,9 +370,11 @@ async function loadHistory() {
   const empty = dom('history-empty');
   const error = dom('history-error');
   const list = dom('history-list');
+  const clearButton = dom('clear-history');
   loading.hidden = false;
   empty.hidden = true;
   error.hidden = true;
+  clearButton.hidden = true;
   list.replaceChildren();
   try {
     const { runs } = await api('/runs');
@@ -303,6 +382,7 @@ async function loadHistory() {
       empty.hidden = false;
       return;
     }
+    clearButton.hidden = false;
     const completeRuns = await Promise.all(runs.map(async (run) => {
       try { return await api(`/runs/${encodeURIComponent(run.run_id)}`); }
       catch { return { manifest: run, ticket: { title: 'Evidence bundle', id: run.run_id }, verdict: { status: run.status, evidence_score: run.score } }; }
@@ -313,6 +393,28 @@ async function loadHistory() {
     error.hidden = false;
   } finally {
     loading.hidden = true;
+  }
+}
+
+async function clearHistory() {
+  const button = dom('clear-history');
+  if (!window.confirm('Clear all stored investigation history for this local demo? This permanently removes evidence bundles from this computer and does not change Jira.')) {
+    return;
+  }
+
+  button.disabled = true;
+  button.textContent = 'Clearing history';
+  try {
+    const result = await api('/runs', { method: 'DELETE' });
+    announce(`Cleared ${result.deleted_run_count} stored investigation ${result.deleted_run_count === 1 ? 'bundle' : 'bundles'}.`);
+    await loadHistory();
+  } catch (error) {
+    const message = dom('history-error');
+    message.textContent = `Unable to clear investigation history. ${error.message}`;
+    message.hidden = false;
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Clear history';
   }
 }
 
@@ -344,5 +446,7 @@ document.querySelectorAll('[data-view-target]').forEach((button) => {
 dom('investigation-form').addEventListener('submit', submitInvestigation);
 dom('repository-kind').addEventListener('change', (event) => setRepositoryFields(event.target.value));
 dom('open-proof').addEventListener('click', () => { if (state.activeRun) showView('evidence'); });
+dom('refresh-activity').addEventListener('click', loadActivity);
+dom('clear-history').addEventListener('click', clearHistory);
 setRepositoryFields(dom('repository-kind').value);
 showView('submit');

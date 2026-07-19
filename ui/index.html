@@ -15,6 +15,7 @@
       </a>
       <nav class="app-nav" aria-label="Workspace navigation">
         <button class="nav-link is-active" type="button" data-view-target="submit">New investigation</button>
+        <button class="nav-link" type="button" data-view-target="activity">Activity</button>
         <button class="nav-link" type="button" data-view-target="history">History</button>
       </nav>
     </header>
@@ -121,6 +122,11 @@
               <div><strong>Producing verdict</strong><span>Signing the evidence bundle and assessing the proof</span></div>
               <small>Waiting</small>
             </li>
+            <li class="stage" data-stage="jira_comment">
+              <span class="stage-marker" aria-hidden="true"></span>
+              <div><strong>Updating Jira</strong><span>Posting the evidence verdict back to the source ticket</span></div>
+              <small>Waiting</small>
+            </li>
           </ol>
           <div id="live-error" class="inline-error" role="alert" hidden></div>
           <div id="live-actions" class="live-actions" hidden>
@@ -160,6 +166,10 @@
             <div class="detail-content"><pre><code id="sandbox-result">No sandbox output is available.</code></pre></div>
           </details>
           <details>
+            <summary>Grounded expected-value proof</summary>
+            <div class="detail-content"><pre><code id="grounded-result">This investigation did not use a contract-backed silent-output proof.</code></pre></div>
+          </details>
+          <details>
             <summary>Independent replays</summary>
             <div class="detail-content"><pre><code id="replay-result">No replay results are available.</code></pre></div>
           </details>
@@ -170,6 +180,24 @@
         </section>
       </section>
 
+      <section id="screen-activity" class="screen" aria-labelledby="activity-title" hidden>
+        <div class="history-heading">
+          <div>
+            <p class="eyebrow">Operator activity</p>
+            <h1 id="activity-title">Incoming investigations</h1>
+            <p>Jira deliveries and manual runs currently held by this service. Open a job to follow its live sandbox and model progress.</p>
+          </div>
+          <button id="refresh-activity" class="secondary-button" type="button">Refresh</button>
+        </div>
+        <div id="activity-loading" class="quiet-state">Loading active work</div>
+        <div id="activity-empty" class="empty-state" hidden>
+          <h2>No active jobs</h2>
+          <p>New labelled Jira issues and manual submissions will appear here while this API service is running.</p>
+        </div>
+        <div id="activity-error" class="inline-error" role="alert" hidden></div>
+        <div id="activity-list" class="history-list" aria-live="polite"></div>
+      </section>
+
       <section id="screen-history" class="screen" aria-labelledby="history-title" hidden>
         <div class="history-heading">
           <div>
@@ -177,7 +205,10 @@
             <h1 id="history-title">Past investigations</h1>
             <p>Each result is an immutable evidence bundle. Open one to review its proof.</p>
           </div>
-          <button class="primary-button" type="button" data-view-target="submit">Run investigation</button>
+          <div class="history-actions">
+            <button id="clear-history" class="danger-button" type="button" hidden>Clear history</button>
+            <button class="primary-button" type="button" data-view-target="submit">Run investigation</button>
+          </div>
         </div>
         <div id="history-loading" class="quiet-state">Loading investigations</div>
         <div id="history-empty" class="empty-state" hidden>

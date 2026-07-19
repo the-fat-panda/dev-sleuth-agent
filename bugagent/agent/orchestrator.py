@@ -21,6 +21,7 @@ from bugagent.domain import (
 )
 from bugagent.sandbox.docker import SandboxRun
 from bugagent.scoring import assess_evidence, assess_ticket
+from bugagent.silent_output import GroundedSilentOutput, ground_silent_output, silent_evidence_from_run
 
 from .client import InvestigationClient
 from .repository import CandidateValidationError, ReadOnlyRepository, validate_candidate
@@ -89,19 +90,37 @@ class InvestigationOrchestrator:
                     tuple(events),
                 )
             candidates.append(candidate)
+            grounded_silent_output = ground_silent_output(candidate, repo_root)
             with candidate_worktree(repo_root, candidate) as worktree:
                 test_path = worktree / candidate.path
                 candidate_run = self.sandbox.run(worktree, test_path)
-                candidate_evidence = _evidence_from_run(candidate_run, attempt, "CANDIDATE", ticket, candidate)
+                candidate_evidence = _evidence_from_run(
+                    candidate_run,
+                    attempt,
+                    "CANDIDATE",
+                    ticket,
+                    candidate,
+                    grounded_silent_output,
+                )
                 evidence.append(candidate_evidence)
 
                 replays: tuple[ExecutionEvidence, ...] = ()
                 if candidate_run.test_failed and candidate_run.setup_valid and not candidate_run.timed_out:
                     replay_one = _evidence_from_run(
-                        self.sandbox.run(worktree, test_path), attempt, "REPLAY", ticket, candidate
+                        self.sandbox.run(worktree, test_path),
+                        attempt,
+                        "REPLAY",
+                        ticket,
+                        candidate,
+                        grounded_silent_output,
                     )
                     replay_two = _evidence_from_run(
-                        self.sandbox.run(worktree, test_path), attempt + 1, "REPLAY", ticket, candidate
+                        self.sandbox.run(worktree, test_path),
+                        attempt + 1,
+                        "REPLAY",
+                        ticket,
+                        candidate,
+                        grounded_silent_output,
                     )
                     replays = (replay_one, replay_two)
                     evidence.extend(replays)
@@ -175,6 +194,7 @@ def _evidence_from_run(
     phase: str,
     ticket: Ticket,
     candidate: CandidateTest,
+    grounded_silent_output: GroundedSilentOutput | None = None,
 ) -> ExecutionEvidence:
     signature = run.normalized_signature()
     symptom_matches = bool(
@@ -203,6 +223,7 @@ def _evidence_from_run(
         environment_fingerprint={"sandbox_image": run.image},
         stdout_sha256=run.stdout_sha256(),
         stderr_sha256=run.stderr_sha256(),
+        silent_output=silent_evidence_from_run(candidate, grounded_silent_output, run),
     )
 
 

@@ -7,7 +7,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
 from bugagent.demo import build_demo_bundle
+from bugagent.jira_api import attach_jira_routes
 from bugagent.jira import (
     JiraConfig,
     JiraConfigurationError,
@@ -84,6 +88,34 @@ class JiraTests(unittest.TestCase):
         with self.assertRaisesRegex(JiraWebhookError, "jira:issue_created"):
             parse_issue_created(payload)
 
+    def test_webhook_adapter_passes_jira_origin_to_the_service(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = _config(Path(directory))
+            app = FastAPI()
+            observed: dict[str, object] = {}
+            attach_jira_routes(
+                app,
+                config,
+                submit=lambda ticket, source, callback, issue: _capture_submission(
+                    observed, ticket, source, callback, issue
+                ),
+                get_job=lambda job_id: {"job_id": job_id, "status": "queued"},
+                emit_progress=lambda *_args, **_kwargs: None,
+            )
+            raw = json.dumps(_webhook_payload()).encode("utf-8")
+            with TestClient(app) as client:
+                response = client.post(
+                    "/integrations/jira/webhook",
+                    content=raw,
+                    headers={"x-hub-signature": _signature(config.webhook_secret, raw)},
+                )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["issue_key"], "SCRUM-7")
+        self.assertEqual(observed["ticket_id"], "SCRUM-7")
+        self.assertEqual(observed["issue_key"], "SCRUM-7")
+        self.assertEqual(observed["issue_url"], "https://example.atlassian.net/rest/api/3/issue/10017")
+
 
 def _config(repo: Path) -> JiraConfig:
     return JiraConfig.from_environment(
@@ -133,6 +165,13 @@ def _webhook_payload() -> dict[str, object]:
 def _signature(secret: str, payload: bytes) -> str:
     digest = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
     return f"sha256={digest}"
+
+
+def _capture_submission(observed, ticket, _source, _callback, issue):
+    observed["ticket_id"] = ticket.id
+    observed["issue_key"] = issue.key
+    observed["issue_url"] = issue.source_url
+    return "job-1"
 
 
 if __name__ == "__main__":

@@ -5,15 +5,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from enum import Enum
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
-from threading import Condition
 from typing import Callable, Iterator, Mapping
-from uuid import uuid4
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -24,6 +22,7 @@ from bugagent.agent import InvestigationOrchestrator, ResponsesInvestigationClie
 from bugagent.agent.client import DEFAULT_MODEL
 from bugagent.artifacts import ArtifactStore, primitive
 from bugagent.api_progress import InvestigationProgressReporter, ProgressInvestigationClient, ProgressSandbox
+from bugagent.api_jobs import JobRegistry, JobSnapshot, JobState
 from bugagent.api_repositories import (
     GitHubRepositorySource,
     RepositorySource,
@@ -127,177 +126,6 @@ class InvestigationRequest(BaseModel):
     repository: RepositorySource
 
 
-class JobState(str, Enum):
-    QUEUED = "queued"
-    RUNNING = "running"
-    DONE = "done"
-    FAILED = "failed"
-
-
-@dataclass(frozen=True, slots=True)
-class JobSnapshot:
-    job_id: str
-    status: JobState
-    created_at: datetime
-    updated_at: datetime
-    run_id: str | None = None
-    verdict: dict[str, object] | None = None
-    error: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class JobProgressEvent:
-    """One API-layer observation of a background investigation stage."""
-
-    sequence: int
-    stage: str
-    state: str
-    label: str
-    occurred_at: datetime
-    attempt: int | None = None
-    detail: dict[str, object] | None = None
-
-    def as_json(self) -> dict[str, object]:
-        payload: dict[str, object] = {
-            "sequence": self.sequence,
-            "stage": self.stage,
-            "state": self.state,
-            "label": self.label,
-            "occurred_at": self.occurred_at.isoformat(),
-        }
-        if self.attempt is not None:
-            payload["attempt"] = self.attempt
-        if self.detail:
-            payload["detail"] = self.detail
-        return payload
-
-
-class JobRegistry:
-    """Small thread-safe, process-local registry for background investigation state."""
-
-    def __init__(self) -> None:
-        self._jobs: dict[str, JobSnapshot] = {}
-        self._events: dict[str, list[JobProgressEvent]] = {}
-        self._condition = Condition()
-
-    def create(self) -> JobSnapshot:
-        now = _now()
-        job = JobSnapshot(job_id=str(uuid4()), status=JobState.QUEUED, created_at=now, updated_at=now)
-        with self._condition:
-            self._jobs[job.job_id] = job
-            self._events[job.job_id] = []
-            self._emit_locked(job.job_id, "job", JobState.QUEUED.value, "Investigation queued")
-        return job
-
-    def get(self, job_id: str) -> JobSnapshot | None:
-        with self._condition:
-            return self._jobs.get(job_id)
-
-    def mark_running(self, job_id: str) -> None:
-        self._replace(job_id, status=JobState.RUNNING)
-        self.emit(job_id, "job", JobState.RUNNING.value, "Investigation started")
-
-    def mark_done(self, job_id: str, bundle: RunBundle) -> None:
-        serialized_verdict = primitive(bundle.verdict)
-        assert isinstance(serialized_verdict, dict)
-        verdict = {
-            "status": serialized_verdict["status"],
-            "score": serialized_verdict["evidence_score"],
-            "rationale": serialized_verdict["rationale"],
-        }
-        self._replace(job_id, status=JobState.DONE, run_id=str(bundle.run_id), verdict=verdict, error=None)
-        self.emit(
-            job_id,
-            "verdict",
-            "completed",
-            "Verdict ready",
-            detail={"run_id": str(bundle.run_id), "status": verdict["status"], "score": verdict["score"]},
-        )
-
-    def mark_failed(self, job_id: str, error: Exception) -> None:
-        message = f"{type(error).__name__}: {error}"
-        self._replace(job_id, status=JobState.FAILED, error=message)
-        self.emit(job_id, "verdict", "failed", "Investigation could not finish", detail={"error": message})
-
-    def emit(
-        self,
-        job_id: str,
-        stage: str,
-        state: str,
-        label: str,
-        *,
-        attempt: int | None = None,
-        detail: dict[str, object] | None = None,
-    ) -> None:
-        with self._condition:
-            self._emit_locked(job_id, stage, state, label, attempt=attempt, detail=detail)
-
-    def wait_for_events(
-        self,
-        job_id: str,
-        after_sequence: int,
-        timeout_seconds: float,
-    ) -> tuple[JobSnapshot | None, tuple[JobProgressEvent, ...]]:
-        """Wait for progress without ever polling the investigation engine itself."""
-        with self._condition:
-            current = self._jobs.get(job_id)
-            if current is None:
-                return None, ()
-            events = self._events.get(job_id, [])
-            if not any(event.sequence > after_sequence for event in events) and current.status not in {
-                JobState.DONE,
-                JobState.FAILED,
-            }:
-                self._condition.wait(timeout_seconds)
-                current = self._jobs.get(job_id)
-                events = self._events.get(job_id, [])
-            return current, tuple(event for event in events if event.sequence > after_sequence)
-
-    def _replace(self, job_id: str, **changes: object) -> None:
-        with self._condition:
-            current = self._jobs.get(job_id)
-            if current is None:
-                return
-            values = {
-                "job_id": current.job_id,
-                "status": current.status,
-                "created_at": current.created_at,
-                "updated_at": _now(),
-                "run_id": current.run_id,
-                "verdict": current.verdict,
-                "error": current.error,
-            }
-            values.update(changes)
-            self._jobs[job_id] = JobSnapshot(**values)
-            self._condition.notify_all()
-
-    def _emit_locked(
-        self,
-        job_id: str,
-        stage: str,
-        state: str,
-        label: str,
-        *,
-        attempt: int | None = None,
-        detail: dict[str, object] | None = None,
-    ) -> None:
-        events = self._events.get(job_id)
-        if events is None:
-            return
-        events.append(
-            JobProgressEvent(
-                sequence=len(events) + 1,
-                stage=stage,
-                state=state,
-                label=label,
-                occurred_at=_now(),
-                attempt=attempt,
-                detail=detail,
-            )
-        )
-        self._condition.notify_all()
-
-
 InvestigationRunner = Callable[[Ticket, Path, str], RunBundle]
 InvestigationRunnerFactory = Callable[["InvestigationProgressReporter"], InvestigationRunner]
 RuntimeValidator = Callable[[APIConfig], None]
@@ -341,8 +169,25 @@ def create_app(
         ticket: Ticket,
         repository: RepositorySource,
         on_completed: JobCompletionCallback | None = None,
+        *,
+        source: str = "manual",
+        issue_key: str | None = None,
+        issue_url: str | None = None,
     ) -> JobSnapshot:
-        job = registry.create()
+        job = registry.create(
+            ticket,
+            source=source,
+            issue_key=issue_key,
+            issue_url=issue_url,
+        )
+        if source == "jira":
+            registry.emit(
+                job.job_id,
+                "jira_intake",
+                "completed",
+                "Jira ticket accepted",
+                detail={"issue_key": issue_key or ticket.id},
+            )
         executor.submit(_run_job, registry, job.job_id, runner_factory, ticket, repository, selected_config.github, on_completed)
         return job
 
@@ -353,12 +198,12 @@ def create_app(
         except (ValueError, GitHubCheckoutError) as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
         job = enqueue(request.ticket.to_ticket(), request.repository)
-        return {
-            "job_id": job.job_id,
-            "status": job.status.value,
-            "status_url": f"/investigations/{job.job_id}",
-            "events_url": f"/investigations/{job.job_id}/events",
-        }
+        return _job_response(job)
+
+    @app.get("/investigations")
+    def list_investigations(limit: int = Query(default=25, ge=1, le=100)) -> dict[str, object]:
+        """List in-process work so webhook-started jobs are observable in the UI."""
+        return {"jobs": [_job_response(job) for job in registry.list_recent(limit)]}
 
     @app.get("/investigations/{job_id}")
     def get_investigation(job_id: str) -> dict[str, object]:
@@ -393,10 +238,22 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
         return primitive(run)
 
+    @app.delete("/runs")
+    def clear_runs() -> dict[str, int]:
+        """Permanently remove completed bundles from the local demo history."""
+        return {"deleted_run_count": _clear_stored_runs(selected_config.runs_root)}
+
     attach_jira_routes(
         app,
         selected_config.jira,
-        submit=lambda ticket, source, callback: enqueue(ticket, source_from_jira(source), callback).job_id,
+        submit=lambda ticket, source, callback, issue: enqueue(
+            ticket,
+            source_from_jira(source),
+            callback,
+            source="jira",
+            issue_key=issue.key,
+            issue_url=issue.source_url,
+        ).job_id,
         get_job=lambda job_id: _job_response(job) if (job := registry.get(job_id)) else None,
         emit_progress=registry.emit,
     )
@@ -482,7 +339,19 @@ def _job_response(job: JobSnapshot) -> dict[str, object]:
         "status": job.status.value,
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
+        "status_url": f"/investigations/{job.job_id}",
+        "events_url": f"/investigations/{job.job_id}/events",
+        "source": job.source,
+        "ticket": {
+            "id": job.ticket_id,
+            "title": job.ticket_title,
+            "repo_ref": job.repo_ref,
+        },
     }
+    if job.issue_key:
+        payload["issue_key"] = job.issue_key
+    if job.issue_url:
+        payload["issue_url"] = job.issue_url
     if job.run_id:
         payload["run_id"] = job.run_id
         payload["run_url"] = f"/runs/{job.run_id}"
@@ -519,6 +388,32 @@ def _event_cursor(request: Request, fallback: int) -> int:
         return fallback
 
 
+def _clear_stored_runs(root: Path) -> int:
+    """Delete only canonical UUID bundle directories directly within the configured root."""
+    resolved_root = root.resolve()
+    if not resolved_root.is_dir():
+        return 0
+
+    deleted = 0
+    for directory in resolved_root.iterdir():
+        if directory.is_symlink() or not directory.is_dir() or not _is_canonical_run_directory(directory.name):
+            continue
+        if not (directory / "manifest.json").is_file():
+            continue
+        if directory.resolve().parent != resolved_root:
+            continue
+        shutil.rmtree(directory)
+        deleted += 1
+    return deleted
+
+
+def _is_canonical_run_directory(name: str) -> bool:
+    try:
+        return str(UUID(name)) == name
+    except ValueError:
+        return False
+
+
 def _positive_integer(source: Mapping[str, str], name: str, default: int) -> int:
     raw = source.get(name, str(default)).strip()
     try:
@@ -541,8 +436,6 @@ def _run_docker_check(command: list[str], message: str) -> None:
         raise APIConfigurationError(f"{message}.{suffix}")
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 if __name__ == "__main__":

@@ -59,12 +59,15 @@ h2 { font-size: 22px; letter-spacing: -0.025em; }
 .field input:focus, .field textarea:focus, .field select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12); outline: 0; }
 .form-footer { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 30px; padding-top: 24px; border-top: 1px solid var(--line); }
 .form-message { min-height: 20px; margin: 0; color: var(--red); font-size: 14px; }
-.primary-button, .secondary-button, .back-button { min-height: 42px; border-radius: var(--radius-small); font-size: 14px; font-weight: 650; transition: background 160ms ease, border-color 160ms ease, color 160ms ease, transform 160ms ease; }
+.primary-button, .secondary-button, .danger-button, .back-button { min-height: 42px; border-radius: var(--radius-small); font-size: 14px; font-weight: 650; transition: background 160ms ease, border-color 160ms ease, color 160ms ease, transform 160ms ease; }
 .primary-button { border: 1px solid var(--blue); padding: 0 17px; color: #fff; background: var(--blue); box-shadow: 0 4px 10px rgba(37, 99, 235, 0.18); }
 .primary-button:hover { border-color: var(--blue-dark); background: var(--blue-dark); transform: translateY(-1px); }
 .primary-button:disabled { cursor: wait; opacity: 0.65; transform: none; }
 .secondary-button { border: 1px solid var(--line-strong); padding: 0 15px; color: var(--text); background: var(--surface); }
 .secondary-button:hover { border-color: #b8c0cc; background: var(--surface-subtle); }
+.danger-button { border: 1px solid #fecaca; padding: 0 15px; color: #b91c1c; background: #fff; }
+.danger-button:hover { border-color: #fca5a5; background: var(--red-wash); }
+.danger-button:disabled { cursor: wait; opacity: 0.65; }
 .back-button { border: 0; padding: 0; color: var(--blue-dark); background: transparent; }
 .back-button:hover { color: var(--blue); text-decoration: underline; text-underline-offset: 3px; }
 
@@ -130,6 +133,7 @@ pre { overflow: auto; margin: 0; padding: 18px; border-radius: var(--radius-smal
 
 .history-heading { margin-bottom: 30px; }
 .history-heading h1 { margin-bottom: 10px; font-size: clamp(36px, 4vw, 50px); }
+.history-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .quiet-state { padding: 38px 0; color: var(--muted); font-size: 14px; }
 .empty-state { padding: 58px 30px; border: 1px dashed #cbd2dc; border-radius: var(--radius); text-align: center; background: var(--surface-subtle); }
 .empty-state h2 { margin-bottom: 8px; }
@@ -145,6 +149,10 @@ pre { overflow: auto; margin: 0; padding: 18px; border-radius: var(--radius-smal
 .history-status { width: fit-content; padding: 5px 8px; border-radius: 999px; color: var(--blue-dark); background: var(--blue-wash); font-size: 11px; font-weight: 750; letter-spacing: 0.03em; text-transform: uppercase; }
 .history-status.is-reproduced { color: #15803d; background: var(--green-wash); }
 .history-status.is-not-reproduced, .history-status.is-need-info, .history-status.is-inconclusive { color: #a16207; background: var(--amber-wash); }
+.history-status.is-job-queued, .history-status.is-job-running { color: var(--blue-dark); background: var(--blue-wash); }
+.history-status.is-job-done { color: #15803d; background: var(--green-wash); }
+.history-status.is-job-failed { color: #b91c1c; background: var(--red-wash); }
+.activity-row .history-score { color: var(--muted-strong); font-family: var(--sans); font-size: 12px; font-weight: 650; }
 .history-score { font-family: var(--mono); font-size: 13px; text-align: right; }
 .history-arrow { color: var(--muted); font-size: 21px; text-align: right; }
 

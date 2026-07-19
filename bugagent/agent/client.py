@@ -9,7 +9,7 @@ from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from bugagent.domain import CandidateTest, Ticket
+from bugagent.domain import CandidateTest, MinorValue, SilentOutputProof, TextValue, Ticket
 
 from .repository import RepositoryContext
 
@@ -114,6 +114,7 @@ class ResponsesInvestigationClient:
                 hypothesis=candidate_data["hypothesis"],
                 expected_symptom=candidate_data["expected_symptom"],
                 public_api_claims=tuple(candidate_data["public_api_claims"]),
+                silent_output=_silent_output_from_data(candidate_data["silent_output"]),
             )
         except (KeyError, TypeError, json.JSONDecodeError) as error:
             raise InvestigationClientError("OpenAI response did not contain a valid candidate-test object.") from error
@@ -147,8 +148,44 @@ def _candidate_schema() -> dict[str, Any]:
                 "hypothesis": {"type": "string"},
                 "expected_symptom": {"type": "string"},
                 "public_api_claims": {"type": "array", "items": {"type": "string"}},
+                "silent_output": {
+                    "type": ["object", "null"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "policy_id": {"type": "string"},
+                        "contract_path": {"type": "string"},
+                        "contract_anchor": {"type": "string"},
+                        "input_values": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {"name": {"type": "string"}, "value": {"type": "string"}},
+                                "required": ["name", "value"],
+                            },
+                        },
+                        "expected_values": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {"name": {"type": "string"}, "minor": {"type": "integer"}},
+                                "required": ["name", "minor"],
+                            },
+                        },
+                        "observed_fields": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": [
+                        "policy_id",
+                        "contract_path",
+                        "contract_anchor",
+                        "input_values",
+                        "expected_values",
+                        "observed_fields",
+                    ],
+                },
             },
-            "required": ["path", "content", "hypothesis", "expected_symptom", "public_api_claims"],
+            "required": ["path", "content", "hypothesis", "expected_symptom", "public_api_claims", "silent_output"],
         },
     }
 
@@ -157,10 +194,42 @@ _SYSTEM_INSTRUCTIONS = """You investigate a Python bug report and propose exactl
 Use only public repository APIs when possible. Do not modify application code. Do not use subprocesses,
 networking, filesystem access, or environment variables in the test. Put the test directly under
 tests/bugagent_generated/. State the expected product failure, not a setup error. If prior feedback
-shows a setup failure, refine the test; do not claim reproduction without sandbox evidence."""
+shows a setup failure, refine the test; do not claim reproduction without sandbox evidence.
+
+For a crash or exception bug, set silent_output to null. For a silent wrong-value bug, set silent_output
+to a grounded proof only when repository source explicitly states the expected business rule. Use
+policy_id "tax_after_discounts_v1" only when the repository's mercato/pricing/tax.py contains the exact
+post-discount tax convention. Cite that exact sentence as contract_anchor. Supply integer minor-unit
+inputs subtotal_minor, discount_minor, shipping_minor, decimal tax_rate, and currency; expected_values
+must contain tax_minor and total_minor. Your test must configure the applicable public TaxPolicy rate,
+assign quote from a public .quote() call, then print exactly one marker before assertions:
+print("BUGAGENT_OBSERVATION " + json.dumps({"tax_minor": quote.tax.minor, "total_minor": quote.total.minor}, sort_keys=True))
+It must assert quote.tax.minor and quote.total.minor against the grounded integer expected values. Do not
+use a silent_output proof if you cannot meet every one of these requirements; return null instead."""
 
 
 def _user_prompt(ticket: Ticket, repository: RepositoryContext, prior_feedback: tuple[str, ...]) -> str:
     feedback = "\n".join(f"- {item}" for item in prior_feedback) or "(none; this is the first attempt)"
     ticket_json = json.dumps(asdict(ticket), indent=2, sort_keys=True)
     return f"Ticket:\n{ticket_json}\n\n{repository.as_prompt_text()}\n\nPrior sandbox feedback:\n{feedback}"
+
+
+def _silent_output_from_data(value: object) -> SilentOutputProof | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError("silent_output must be an object or null")
+    input_values = tuple(
+        TextValue(name=item["name"], value=item["value"]) for item in value["input_values"]
+    )
+    expected_values = tuple(
+        MinorValue(name=item["name"], minor=item["minor"]) for item in value["expected_values"]
+    )
+    return SilentOutputProof(
+        policy_id=value["policy_id"],
+        contract_path=value["contract_path"],
+        contract_anchor=value["contract_anchor"],
+        input_values=input_values,
+        expected_values=expected_values,
+        observed_fields=tuple(value["observed_fields"]),
+    )

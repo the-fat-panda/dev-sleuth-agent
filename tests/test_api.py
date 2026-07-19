@@ -52,7 +52,14 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 202)
                 accepted = response.json()
                 self.assertEqual(accepted["status"], "queued")
+                self.assertEqual(accepted["source"], "manual")
+                self.assertEqual(accepted["ticket"]["id"], "API-1")
                 self.assertTrue(writer.started.wait(timeout=1))
+
+                active = client.get("/investigations")
+                self.assertEqual(active.status_code, 200)
+                self.assertEqual(active.json()["jobs"][0]["job_id"], accepted["job_id"])
+                self.assertEqual(active.json()["jobs"][0]["ticket"]["title"], "Close action crashes")
 
                 running = client.get(accepted["status_url"])
                 self.assertEqual(running.status_code, 200)
@@ -73,6 +80,12 @@ class ApiTests(unittest.TestCase):
                 stored = client.get(f"/runs/{run_id}")
                 self.assertEqual(stored.status_code, 200)
                 self.assertEqual(stored.json()["ticket"]["id"], "API-1")
+
+                cleared = client.delete("/runs")
+                self.assertEqual(cleared.status_code, 200)
+                self.assertEqual(cleared.json(), {"deleted_run_count": 1})
+                self.assertEqual(client.get("/runs").json(), {"runs": []})
+                self.assertEqual(client.get(f"/runs/{run_id}").status_code, 404)
 
                 stream = client.get(accepted["events_url"])
                 self.assertEqual(stream.status_code, 200)
@@ -150,6 +163,22 @@ class ApiTests(unittest.TestCase):
         self.assertIn(("replay_1", "completed"), stages)
         self.assertIn(("replay_2", "completed"), stages)
         self.assertIn(("verdict", "started"), stages)
+
+    def test_job_registry_preserves_jira_origin_for_activity_view(self) -> None:
+        registry = JobRegistry()
+        ticket = Ticket("SCRUM-5", "Checkout total is wrong", "A customer report", "demo@main")
+        job = registry.create(
+            ticket,
+            source="jira",
+            issue_key="SCRUM-5",
+            issue_url="https://example.atlassian.net/browse/SCRUM-5",
+        )
+
+        observed = registry.list_recent(25)
+
+        self.assertEqual(observed, (job,))
+        self.assertEqual(observed[0].source, "jira")
+        self.assertEqual(observed[0].issue_key, "SCRUM-5")
 
 
 def _config(runs_root: Path) -> APIConfig:

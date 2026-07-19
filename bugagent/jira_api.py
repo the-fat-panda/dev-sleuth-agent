@@ -10,6 +10,7 @@ from bugagent.domain import RunBundle, Ticket
 from bugagent.jira import (
     JiraCloudClient,
     JiraConfig,
+    JiraIssue,
     ProjectSource,
     JiraWebhookError,
     JiraWebhookRouter,
@@ -17,7 +18,7 @@ from bugagent.jira import (
 )
 
 SubmitInvestigation = Callable[
-    [Ticket, ProjectSource, Callable[[str, RunBundle], None] | None],
+    [Ticket, ProjectSource, Callable[[str, RunBundle], None] | None, JiraIssue],
     str,
 ]
 GetJobResponse = Callable[[str], dict[str, object] | None]
@@ -64,6 +65,7 @@ def attach_jira_routes(
                 ticket,
                 mapped_source,
                 _jira_completion_publisher(client, issue.key, emit_progress),
+                issue,
             ),
         )
         payload = get_job(job_id)

@@ -13,6 +13,7 @@ license = { text = "MIT" }
 [project.scripts]
 bugagent = "bugagent.cli:main"
 bugagent-api = "bugagent.api:main"
+bugagent-jira-webhook-gateway = "bugagent.jira_gateway:main"
 
 [project.optional-dependencies]
 api = ["fastapi>=0.121,<1.0", "starlette>=0.40,<0.51", "uvicorn>=0.30,<1.0"]

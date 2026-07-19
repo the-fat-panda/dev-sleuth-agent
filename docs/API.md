@@ -71,7 +71,10 @@ The service responds immediately with HTTP `202`:
 {
   "job_id": "e372d1a7-58d8-44e5-86cf-775a9550f3c2",
   "status": "queued",
-  "status_url": "/investigations/e372d1a7-58d8-44e5-86cf-775a9550f3c2"
+  "status_url": "/investigations/e372d1a7-58d8-44e5-86cf-775a9550f3c2",
+  "events_url": "/investigations/e372d1a7-58d8-44e5-86cf-775a9550f3c2/events",
+  "source": "manual",
+  "ticket": {"id": "LOCAL-1", "title": "Fresh records fail during normal close", "repo_ref": "sandbox-live@fixture"}
 }
 ```
 
@@ -116,14 +119,16 @@ The browser workspace renders these events as a single focused live timeline wit
 | Method | Path | Response |
 |---|---|---|
 | `POST` | `/investigations` | `202` with job ID and polling path; validates a local source or allowed GitHub repository before queuing. |
+| `GET` | `/investigations` | Newest-first, in-process activity list of queued, running, completed, and failed jobs. Each entry includes the source, ticket summary, status/event URLs, and Jira issue metadata when applicable. |
 | `GET` | `/investigations/{job_id}` | Current in-process job state; completed jobs include the run ID and verdict summary, failed jobs include a safe error string. |
 | `GET` | `/investigations/{job_id}/events` | Retained Server-Sent Event stream of API-layer stage progress for a job. |
 | `GET` | `/runs` | Summaries of completed immutable bundles from `BUGAGENT_RUNS_ROOT`. |
 | `GET` | `/runs/{run_id}` | Full JSON-safe artifact bundle: manifest, ticket, candidates, evidence, verdict, and timeline. |
+| `DELETE` | `/runs` | Permanently removes completed local run bundles and returns `deleted_run_count`. This is the explicit demo-history reset; it does not change Jira. |
 | `GET` | `/` | Redirects to the web workspace. |
 | `GET` | `/app/` | Responsive investigation workspace: submit, live progress, evidence, and history. |
 
-The job registry is intentionally in-process for this first service layer. Restarting the API loses active-job state, although completed bundles remain available through the run endpoints. There is no authentication, durable queue, repository cloning, or replay endpoint yet.
+The job registry is intentionally in-process for this first service layer. The workspace **Activity** view polls this list, including Jira-originated jobs, and opens its retained SSE timeline. Restarting the API loses active-job state, although completed bundles remain available through the run endpoints. There is no general API authentication, durable queue, or replay endpoint yet. The main API must remain on loopback; its public Jira ingress is described below.
 
 ## Optional Jira Cloud intake
 
@@ -140,6 +145,44 @@ $env:BUGAGENT_JIRA_PROJECT_SOURCES = '{"SCRUM":{"kind":"github","repo_ref":"the-
 `BUGAGENT_JIRA_PROJECT_SOURCES` maps a Jira project to either a `local_path` source or an allow-listed `github` source. The GitHub mapping above clones a clean disposable checkout and records the resolved commit SHA in the evidence bundle. Its repository must also appear in `BUGAGENT_GITHUB_ALLOWED_REPOSITORIES`.
 
 Jira Cloud signs dynamic webhooks with an `X-Hub-Signature` HMAC header. Register `POST /integrations/jira/webhook` only at a publicly reachable **HTTPS** URL and use the same secret in Jira and `BUGAGENT_JIRA_WEBHOOK_SECRET`. The API returns promptly after queueing work, validates the `jira:issue_created` event and project mapping, and ignores a repeated delivery for the same issue while the process remains alive. A final evidence comment includes the verdict, score, candidate path, normalized observed result, and rationale.
+
+### Public webhook gateway for a demo tunnel
+
+Do **not** tunnel port 8001 directly: its investigation and evidence endpoints are deliberately local-only and currently have no general API authentication. Instead, start the narrow gateway below. It listens on loopback port 8002, exposes only `POST /integrations/jira/webhook`, and forwards only the Jira payload plus `X-Hub-Signature` to port 8001. The upstream verifies the HMAC; the gateway is not an alternate authentication mechanism.
+
+```powershell
+# The main API remains on 127.0.0.1:8001.
+python -m bugagent.jira_gateway
+
+# Create a temporary public HTTPS URL for only the gateway listener.
+cloudflared tunnel --url http://127.0.0.1:8002
+```
+
+Register the generated `https://…trycloudflare.com/integrations/jira/webhook` URL in Jira for the `jira:issue_created` event and supply the same webhook secret. Quick Tunnels are appropriate for a supervised demo only: their URL changes whenever the tunnel restarts. A production deployment needs an authenticated API, durable job store, and managed ingress.
+
+### One-command labelled-demo registration
+
+For a demo without a Cloudflare-managed domain or paid ngrok reservation, run the checked-in helper from an **elevated PowerShell** in the repository root:
+
+```powershell
+.\scripts\start_jira_demo.ps1
+```
+
+It starts the private API if needed, starts the webhook-only gateway, creates (or reuses) an ephemeral Quick Tunnel, and creates or updates exactly one Jira webhook named `DevSleuthAgent labelled demo intake (SCRUM)`. The webhook is deliberately restricted to:
+
+```text
+project = SCRUM AND labels = devsleuth-demo
+```
+
+Only a newly created issue with the `devsleuth-demo` label can be sent to the tunnel or consume model/sandbox budget. Each later demo session runs the same one command; it discovers the new random tunnel URL and updates the same Jira webhook rather than creating duplicates. The state file and runtime logs live under ignored `.tools/`.
+
+Close the public demo endpoint after a session:
+
+```powershell
+.\scripts\stop_jira_demo.ps1
+```
+
+The stop command closes the tunnel only. Jira retains the webhook record, but its URL is intentionally stale until the next `start_jira_demo.ps1` call repoints it.
 
 | Method | Path | Response |
 |---|---|---|

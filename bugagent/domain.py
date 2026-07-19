@@ -51,12 +51,56 @@ class Ticket:
 
 
 @dataclass(frozen=True, slots=True)
+class TextValue:
+    """A named textual input supplied for a deterministic silent-output oracle."""
+
+    name: str
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class MinorValue:
+    """A named integer minor-unit amount, avoiding floating-point ambiguity."""
+
+    name: str
+    minor: int
+
+
+@dataclass(frozen=True, slots=True)
+class SilentOutputProof:
+    """Model-proposed contract citation and inputs; never trusted without verification."""
+
+    policy_id: str
+    contract_path: str
+    contract_anchor: str
+    input_values: tuple[TextValue, ...]
+    expected_values: tuple[MinorValue, ...]
+    observed_fields: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SilentOutputEvidence:
+    """Auditable, independently checked proof of a wrong returned value."""
+
+    policy_id: str
+    contract_path: str
+    contract_sha256: str | None
+    contract_anchor: str
+    input_values: tuple[TextValue, ...]
+    expected_values: tuple[MinorValue, ...]
+    observed_values: tuple[MinorValue, ...]
+    probe_verified: bool
+    verification_error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateTest:
     path: str
     content: str
     hypothesis: str
     expected_symptom: str
     public_api_claims: tuple[str, ...] = ()
+    silent_output: SilentOutputProof | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +123,7 @@ class ExecutionEvidence:
     environment_fingerprint: dict[str, str]
     stdout_sha256: str
     stderr_sha256: str
+    silent_output: SilentOutputEvidence | None = None
 
     def has_execution_disqualifier(self) -> bool:
         return (
