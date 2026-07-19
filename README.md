@@ -47,9 +47,26 @@ python -m scripts.run_evaluation_checkpoint --image $image
 
 The current frozen baseline is intentionally small. It is a regression gate, not an accuracy claim; expand it to the documented 8-12 independently adjudicated cases before submission.
 
+## Run a real investigation
+
+After setting `OPENAI_API_KEY`, run a real Responses API investigation against a pinned local checkout. The source and ticket are sent to the configured OpenAI model; the generated test executes only in the restricted local sandbox.
+
+```powershell
+python -m bugagent investigate `
+  --ticket-id LOCAL-1 `
+  --title "Fresh records fail during normal close" `
+  --body "A customer says the normal close action crashes on a new record before it has activity." `
+  --repo-ref sandbox-live@fixture `
+  --repo fixtures/sandbox_live `
+  --commit fixture `
+  --image $image
+```
+
+Alternatively provide `--ticket-file` with a JSON object containing the `id`, `title`, `body`, and `repo_ref` Ticket fields. The command prints its verdict, score rationale, generated candidate test, and immutable artifact path. The client sends `store:false` to the Responses API.
+
 ## OpenAI integration
 
-`ResponsesInvestigationClient` uses the current Responses API with strict JSON schema output and defaults to `gpt-5.6`. Set `OPENAI_API_KEY` before wiring it into a production intake surface. The offline scripted fixture keeps the judge demo repeatable without credentials.
+`ResponsesInvestigationClient` uses the current Responses API with strict JSON schema output and defaults to `gpt-5.6-terra`. Set `OPENAI_API_KEY` before wiring it into a production intake surface. The offline scripted fixture keeps the judge demo repeatable without credentials.
 
 ## Design and submission materials
 

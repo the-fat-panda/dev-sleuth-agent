@@ -12,6 +12,7 @@ from bugagent.agent import (
     ResponsesInvestigationClient,
     ScriptedInvestigationClient,
 )
+from bugagent.agent.client import DEFAULT_MODEL
 from bugagent.demo import build_demo_bundle
 from bugagent.domain import CandidateTest, Ticket, VerdictStatus
 from bugagent.sandbox.docker import CommandResult, SandboxRun
@@ -131,7 +132,8 @@ class ResponsesClientTests(unittest.TestCase):
 
         payload = observed["payload"]
         assert isinstance(payload, dict)
-        self.assertEqual(payload["model"], "gpt-5.6")
+        self.assertEqual(payload["model"], DEFAULT_MODEL)
+        self.assertFalse(payload["store"])
         self.assertTrue(payload["text"]["format"]["strict"])
         self.assertEqual(candidate.path, "tests/bugagent_generated/test_close.py")
 

@@ -15,7 +15,7 @@ BugAgent's intended end-to-end behavior is:
 |---|---|---|
 | Ticket data model and evidence verdicts | Done | Typed `Ticket`, evidence, verdict, and event records. |
 | Reproduction agent loop | Done as a local core | Bounded candidate-test generation, safe repository context, and two clean replays. |
-| OpenAI investigation client | Implemented, not live-validated | Strict-schema Responses API client; local demo uses a deterministic scripted client. |
+| OpenAI investigation client | Live-validated on banklib | `gpt-5.6-terra` produced a safe regression test from a vague ticket; the real Docker sandbox and two replays returned `REPRODUCED`. |
 | Sandbox for reproduction | Done | No-network, read-only, unprivileged Docker execution with resource limits. |
 | Evidence scoring and artifact bundles | Done | Deterministic verdict rubric, immutable run bundles, SHA-256 manifest. |
 | Independent replay | Done | Verifies bundle hashes and reruns the candidate twice in a disposable copy. |
@@ -38,6 +38,7 @@ BugAgent's intended end-to-end behavior is:
 | Agent-to-proof | Scripted candidate creates a `REPRODUCED` bundle with score 100. |
 | Evidence console | Local dashboard renders a bundle and its audit timeline. |
 | Replay and release gate | Independent replay produces two matching signatures; 3/3 frozen controls pass. |
+| Live investigation | A real `gpt-5.6-terra` call generated `Account().close()` for a vague banklib ticket; it failed with `ZeroDivisionError` at `banklib/account.py:6` and two replays agreed. |
 
 ## Remaining implementation plan
 
@@ -59,4 +60,4 @@ Add a durable queue, retry and idempotency policy, webhook signature verificatio
 
 ## What is deliberately not claimed
 
-BugAgent is not yet a Jira bot, a code-fixing agent, or a PR automation product. It currently proves the middle of that future flow: **local ticket input -> sandboxed reproduction attempt -> evidence bundle -> independent replay and review**.
+BugAgent is not yet a Jira bot, a code-fixing agent, or a PR automation product. It currently proves the middle of that future flow: **local ticket input -> real-model sandboxed reproduction attempt -> evidence bundle -> independent replay and review**.

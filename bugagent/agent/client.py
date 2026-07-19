@@ -13,6 +13,8 @@ from bugagent.domain import CandidateTest, Ticket
 
 from .repository import RepositoryContext
 
+DEFAULT_MODEL = "gpt-5.6-terra"
+
 
 class InvestigationClientError(RuntimeError):
     pass
@@ -54,7 +56,7 @@ class ResponsesInvestigationClient:
         self,
         api_key: str,
         *,
-        model: str = "gpt-5.6",
+        model: str = DEFAULT_MODEL,
         request_sender: Callable[[Request, float], Any] | None = None,
     ) -> None:
         if not api_key.strip():
@@ -64,7 +66,7 @@ class ResponsesInvestigationClient:
         self._request_sender = request_sender or _send_request
 
     @classmethod
-    def from_environment(cls, *, model: str = "gpt-5.6") -> "ResponsesInvestigationClient":
+    def from_environment(cls, *, model: str = DEFAULT_MODEL) -> "ResponsesInvestigationClient":
         return cls(os.environ.get("OPENAI_API_KEY", ""), model=model)
 
     def propose(
@@ -75,6 +77,7 @@ class ResponsesInvestigationClient:
     ) -> CandidateTest:
         payload = {
             "model": self.model,
+            "store": False,
             "input": [
                 {"role": "system", "content": _SYSTEM_INSTRUCTIONS},
                 {
