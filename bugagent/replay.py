@@ -109,8 +109,10 @@ def load_verified_bundle(bundle_directory: Path) -> dict[str, Any]:
             raise BundleIntegrityError(f"Artifact hash mismatch: {name}")
     return {
         "manifest": manifest,
+        "ticket": _read_json(root / "ticket.json"),
         "candidates": _read_json(root / "candidates.json"),
         "evidence": _read_json(root / "evidence.json"),
+        "verdict": _read_json(root / "verdict.json"),
     }
 
 

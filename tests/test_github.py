@@ -17,6 +17,8 @@ class GitHubTests(unittest.TestCase):
         self.assertIsNone(GitHubConfig.from_environment({}))
         with self.assertRaisesRegex(GitHubConfigurationError, "ALLOWED_REPOSITORIES"):
             GitHubConfig.from_environment({"BUGAGENT_GITHUB_TOKEN": "secret"})
+        with self.assertRaisesRegex(GitHubConfigurationError, "ALLOWED_REPOSITORIES"):
+            GitHubConfig.from_environment({"BUGAGENT_GITHUB_PR_PUBLISH_ENABLED": "true"})
 
     def test_source_is_limited_to_the_configured_repository(self) -> None:
         config = GitHubConfig.from_environment({"BUGAGENT_GITHUB_ALLOWED_REPOSITORIES": "the-fat-panda/e-commerce"})
@@ -24,6 +26,28 @@ class GitHubTests(unittest.TestCase):
         validate_submission_source(GitHubRepositorySource(repository="the-fat-panda/e-commerce", ref="backend-main"), config)
         with self.assertRaisesRegex(GitHubCheckoutError, "not in BUGAGENT"):
             validate_submission_source(GitHubRepositorySource(repository="other/example", ref="main"), config)
+
+    def test_pr_publishing_is_disabled_unless_explicitly_enabled(self) -> None:
+        config = GitHubConfig.from_environment(
+            {
+                "BUGAGENT_GITHUB_ALLOWED_REPOSITORIES": "the-fat-panda/e-commerce",
+                "BUGAGENT_GITHUB_TOKEN": "private-token",
+            }
+        )
+        assert config is not None
+        self.assertFalse(config.publish_enabled)
+        with self.assertRaisesRegex(GitHubCheckoutError, "publishing is disabled"):
+            config.require_publish_access("the-fat-panda/e-commerce")
+
+        enabled = GitHubConfig.from_environment(
+            {
+                "BUGAGENT_GITHUB_ALLOWED_REPOSITORIES": "the-fat-panda/e-commerce",
+                "BUGAGENT_GITHUB_TOKEN": "private-token",
+                "BUGAGENT_GITHUB_PR_PUBLISH_ENABLED": "true",
+            }
+        )
+        assert enabled is not None
+        self.assertTrue(enabled.publish_enabled)
 
     def test_checkout_resolves_a_full_sha_without_exposing_a_token_in_command(self) -> None:
         config = GitHubConfig.from_environment(

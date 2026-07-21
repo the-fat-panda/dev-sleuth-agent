@@ -122,8 +122,15 @@ The browser workspace renders these events as a single focused live timeline wit
 | `GET` | `/investigations` | Newest-first, in-process activity list of queued, running, completed, and failed jobs. Each entry includes the source, ticket summary, status/event URLs, and Jira issue metadata when applicable. |
 | `GET` | `/investigations/{job_id}` | Current in-process job state; completed jobs include the run ID and verdict summary, failed jobs include a safe error string. |
 | `GET` | `/investigations/{job_id}/events` | Retained Server-Sent Event stream of API-layer stage progress for a job. |
+| `GET` | `/automation/yolo` | Reports whether autonomous Jira-to-draft-PR mode is active and whether its GitHub/Jira prerequisites are met. |
+| `PUT` | `/automation/yolo` | With `{"enabled": true, "confirm": true}`, enables autonomous handling for future reproduced Jira tickets. It resets off on API restart and is rejected unless Jira, a GitHub write token, and `BUGAGENT_GITHUB_PR_PUBLISH_ENABLED=true` are configured. |
 | `GET` | `/runs` | Summaries of completed immutable bundles from `BUGAGENT_RUNS_ROOT`. |
-| `GET` | `/runs/{run_id}` | Full JSON-safe artifact bundle: manifest, ticket, candidates, evidence, verdict, and timeline. |
+| `GET` | `/runs/{run_id}` | Full JSON-safe artifact bundle: manifest, ticket, candidates, evidence, verdict, timeline, and highest persisted fix/PR state. |
+| `POST` | `/runs/{run_id}/fixes` | Starts a background fix-preparation job only for a `REPRODUCED` bundle. The target GitHub repository and branch must exactly match the reproduced source. It creates a local validated PR plan; it never publishes. |
+| `GET` | `/fixes/{job_id}` | Poll local fix-preparation status. A completed job includes the local plan ID and JSON URL. |
+| `GET` | `/pull-request-plans/{plan_id}` | Reads one validated local PR plan, its safe publication capability, and its persisted publication record if one exists. |
+| `POST` | `/pull-request-plans/{plan_id}/publish` | Requires `{"confirm": true}`, a GitHub write token, and `BUGAGENT_GITHUB_PR_PUBLISH_ENABLED=true`. Starts a background job that rechecks the base commit, pushes the validated branch, opens a draft PR, and posts the PR link to mapped Jira tickets. |
+| `GET` | `/pull-request-publications/{job_id}` | Polls the explicit draft-PR publication job, including GitHub and Jira-backlink result. |
 | `DELETE` | `/runs` | Permanently removes completed local run bundles and returns `deleted_run_count`. This is the explicit demo-history reset; it does not change Jira. |
 | `GET` | `/` | Redirects to the web workspace. |
 | `GET` | `/app/` | Responsive investigation workspace: submit, live progress, evidence, and history. |

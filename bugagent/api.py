@@ -5,11 +5,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+from threading import Lock
 from typing import Callable, Iterator, Mapping
 from uuid import UUID
 
@@ -20,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from bugagent.agent import InvestigationOrchestrator, ResponsesInvestigationClient
 from bugagent.agent.client import DEFAULT_MODEL
+from bugagent.agent.repository import ReadOnlyRepository
 from bugagent.artifacts import ArtifactStore, primitive
 from bugagent.api_progress import InvestigationProgressReporter, ProgressInvestigationClient, ProgressSandbox
 from bugagent.api_jobs import JobRegistry, JobSnapshot, JobState
@@ -30,12 +33,25 @@ from bugagent.api_repositories import (
     source_from_jira,
     validate_submission_source,
 )
-from bugagent.domain import RunBundle, Ticket
+from bugagent.domain import RunBundle, Ticket, VerdictStatus
+from bugagent.fix import (
+    FixValidationError,
+    PatchValidator,
+    PublishedPullRequest,
+    PullRequestPlan,
+    PullRequestPublisher,
+    ResponsesFixClient,
+    prepare_pull_request,
+    write_pull_request_plan,
+)
+from bugagent.fix_jobs import FixJob, FixJobRegistry
 from bugagent.github import GitHubCheckoutError, GitHubConfig, validate_git_available
-from bugagent.jira import JiraConfig
+from bugagent.jira import GitHubProjectSource, JiraCloudClient, JiraConfig, format_pull_request_comment
 from bugagent.jira_api import attach_jira_routes
+from bugagent.publish_jobs import PublicationJob, PublicationJobRegistry
 from bugagent.sandbox import DockerSandbox, SandboxPolicy
 from bugagent.web import RunStore
+from bugagent.replay import _candidate_from_json
 
 
 class APIConfigurationError(RuntimeError):
@@ -126,10 +142,53 @@ class InvestigationRequest(BaseModel):
     repository: RepositorySource
 
 
+class FixPreparationRequest(BaseModel):
+    """A validated PR must target the same GitHub branch that was reproduced."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repository: GitHubRepositorySource
+    base_branch: str = Field(min_length=1, max_length=255)
+
+
+class PullRequestPublicationRequest(BaseModel):
+    """The browser must make an explicit, deliberate publish confirmation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: bool
+
+
+class AutomationModeRequest(BaseModel):
+    """Explicit local-operator consent for autonomous Jira-to-draft-PR handling."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    confirm: bool = False
+
+
+class AutonomousPublishMode:
+    """A restart-safe default-off runtime switch; the API itself remains loopback-only."""
+
+    def __init__(self) -> None:
+        self._enabled = False
+        self._lock = Lock()
+
+    def enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+    def set_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self._enabled = enabled
+
+
 InvestigationRunner = Callable[[Ticket, Path, str], RunBundle]
 InvestigationRunnerFactory = Callable[["InvestigationProgressReporter"], InvestigationRunner]
 RuntimeValidator = Callable[[APIConfig], None]
 JobCompletionCallback = Callable[[str, RunBundle], None]
+PullRequestPublisherRunner = Callable[[PullRequestPlan, GitHubConfig], PublishedPullRequest]
 
 
 def create_app(
@@ -137,16 +196,23 @@ def create_app(
     *,
     startup_validator: RuntimeValidator = validate_runtime,
     investigation_runner: InvestigationRunner | None = None,
+    pull_request_publisher: PullRequestPublisherRunner | None = None,
 ) -> FastAPI:
     """Create an API app without importing or changing the investigation core."""
     selected_config = config or APIConfig.from_environment()
     registry = JobRegistry()
+    fix_registry = FixJobRegistry()
+    publication_registry = PublicationJobRegistry()
+    autonomous_mode = AutonomousPublishMode()
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bugagent-investigation")
+    fix_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bugagent-fix")
+    publication_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bugagent-publication")
     runner_factory: InvestigationRunnerFactory
     if investigation_runner is None:
         runner_factory = lambda progress: _live_runner(selected_config, progress)
     else:
         runner_factory = lambda progress: investigation_runner
+    publisher_runner = pull_request_publisher or (lambda plan, github: PullRequestPublisher(github).publish(plan))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -155,6 +221,8 @@ def create_app(
             yield
         finally:
             executor.shutdown(wait=False, cancel_futures=False)
+            fix_executor.shutdown(wait=False, cancel_futures=False)
+            publication_executor.shutdown(wait=False, cancel_futures=False)
 
     app = FastAPI(
         title="DevSleuthAgent Investigation API",
@@ -164,6 +232,9 @@ def create_app(
     )
     app.state.config = selected_config
     app.state.jobs = registry
+    app.state.fix_jobs = fix_registry
+    app.state.publication_jobs = publication_registry
+    app.state.autonomous_mode = autonomous_mode
 
     def enqueue(
         ticket: Ticket,
@@ -227,16 +298,161 @@ def create_app(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.get("/automation/yolo")
+    def get_yolo_mode() -> dict[str, object]:
+        capability = _yolo_capability(selected_config)
+        return {"enabled": autonomous_mode.enabled(), **capability}
+
+    @app.put("/automation/yolo")
+    def set_yolo_mode(request: AutomationModeRequest) -> dict[str, object]:
+        capability = _yolo_capability(selected_config)
+        if request.enabled:
+            if not request.confirm:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="Set confirm=true to enable YOLO mode for future Jira tickets.",
+                )
+            if not capability["available"]:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(capability["reason"]))
+        autonomous_mode.set_enabled(request.enabled)
+        return {"enabled": autonomous_mode.enabled(), **capability}
+
     @app.get("/runs")
     def list_runs() -> dict[str, object]:
-        return {"runs": primitive(RunStore(selected_config.runs_root).list_runs())}
+        runs = RunStore(selected_config.runs_root).list_runs()
+        return {"runs": primitive([_run_summary_with_fix_status(run, selected_config.runs_root) for run in runs])}
 
     @app.get("/runs/{run_id}")
     def get_run(run_id: str) -> object:
         run = RunStore(selected_config.runs_root).get_run(run_id)
         if run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
+        run["fix"] = _fix_status_for_run(selected_config.runs_root, run_id)
         return primitive(run)
+
+    @app.post("/runs/{run_id}/fixes", status_code=status.HTTP_202_ACCEPTED)
+    def prepare_fix(run_id: str, request: FixPreparationRequest) -> dict[str, object]:
+        run = RunStore(selected_config.runs_root).get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
+        if run["verdict"].get("status") != "REPRODUCED":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Only a REPRODUCED evidence bundle can start fix preparation.",
+            )
+        try:
+            validate_submission_source(request.repository, selected_config.github)
+            _validate_fix_request_source(run, request)
+        except (ValueError, GitHubCheckoutError) as error:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
+        job = fix_registry.create(run_id)
+        fix_executor.submit(_run_fix_job, fix_registry, job.job_id, run, request, selected_config)
+        return _fix_job_response(job)
+
+    @app.get("/fixes/{job_id}")
+    def get_fix_job(job_id: str) -> dict[str, object]:
+        job = fix_registry.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Fix preparation job not found.")
+        return _fix_job_response(job)
+
+    @app.get("/runs/{run_id}/fix-status")
+    def get_run_fix_status(run_id: str) -> dict[str, object]:
+        """Let an evidence view reattach to a YOLO-started fix job without a page refresh."""
+        run = RunStore(selected_config.runs_root).get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found.")
+        if job := fix_registry.latest_for_run(run_id):
+            return _fix_job_response(job)
+        if plan := _prepared_plan_for_run(selected_config.runs_root, run_id):
+            plan_id = plan.get("plan_id")
+            if isinstance(plan_id, str):
+                return {
+                    "run_id": run_id,
+                    "status": "done",
+                    "plan_id": plan_id,
+                    "plan_url": f"/pull-request-plans/{plan_id}",
+                    "progress": {
+                        "stage": "pr_plan",
+                        "state": "completed",
+                        "label": "Validated local PR plan ready",
+                    },
+                    "events": [],
+                }
+        return {"run_id": run_id, "status": "not_started"}
+
+    @app.get("/pull-request-plans/{plan_id}")
+    def get_pull_request_plan(plan_id: str) -> dict[str, object]:
+        plan_path = _prepared_plan_path(selected_config.runs_root, plan_id)
+        try:
+            payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        except OSError as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Prepared pull-request plan not found.") from error
+        publication = _publication_for_plan(selected_config.runs_root, plan_id)
+        if publication is not None:
+            payload["publication"] = publication
+        repository = payload.get("repository")
+        if isinstance(repository, str):
+            payload["publication_capability"] = _publication_capability(selected_config.github, repository)
+        return payload
+
+    @app.get("/runs/{run_id}/pull-request-plan")
+    def get_run_pull_request_plan(run_id: str) -> dict[str, object]:
+        plan = _prepared_plan_for_run(selected_config.runs_root, run_id)
+        if plan is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No prepared pull-request plan for this run.")
+        plan_id = plan.get("plan_id")
+        if isinstance(plan_id, str) and (publication := _publication_for_plan(selected_config.runs_root, plan_id)) is not None:
+            plan["publication"] = publication
+        repository = plan.get("repository")
+        if isinstance(repository, str):
+            plan["publication_capability"] = _publication_capability(selected_config.github, repository)
+        return plan
+
+    @app.post("/pull-request-plans/{plan_id}/publish", status_code=status.HTTP_202_ACCEPTED)
+    def publish_pull_request(plan_id: str, request: PullRequestPublicationRequest) -> dict[str, object]:
+        if not request.confirm:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Set confirm=true to publish the validated draft pull request.",
+            )
+        try:
+            plan = _read_pull_request_plan(selected_config.runs_root, plan_id)
+        except (OSError, ValueError, FixValidationError, json.JSONDecodeError) as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+        if _publication_for_plan(selected_config.runs_root, str(plan.plan_id)) is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This validated plan has already published a draft pull request.",
+            )
+        if selected_config.github is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="GitHub configuration is required to publish a pull request.")
+        try:
+            selected_config.github.require_publish_access(plan.repository)
+        except GitHubCheckoutError as error:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(error)) from error
+        run = RunStore(selected_config.runs_root).get_run(str(plan.run_id))
+        if run is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="The evidence bundle for this validated plan is no longer available.")
+        job, created = publication_registry.create(str(plan.run_id), str(plan.plan_id))
+        if created:
+            publication_executor.submit(
+                _run_publication_job,
+                publication_registry,
+                job.job_id,
+                plan,
+                run,
+                selected_config,
+                publisher_runner,
+            )
+        return _publication_job_response(job)
+
+    @app.get("/pull-request-publications/{job_id}")
+    def get_pull_request_publication(job_id: str) -> dict[str, object]:
+        job = publication_registry.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pull-request publication job not found.")
+        return _publication_job_response(job)
 
     @app.delete("/runs")
     def clear_runs() -> dict[str, int]:
@@ -256,6 +472,21 @@ def create_app(
         ).job_id,
         get_job=lambda job_id: _job_response(job) if (job := registry.get(job_id)) else None,
         emit_progress=registry.emit,
+        after_completion=lambda job_id, bundle, issue, source, yolo_requested: _continue_yolo_from_jira(
+            registry,
+            job_id,
+            bundle,
+            issue.key,
+            source,
+            selected_config,
+            fix_registry,
+            publication_registry,
+            fix_executor,
+            publication_executor,
+            publisher_runner,
+            yolo_requested,
+        ),
+        autonomous_requested=lambda _issue, _source: autonomous_mode.enabled(),
     )
 
     ui_root = Path(__file__).resolve().parents[1] / "ui"
@@ -328,9 +559,283 @@ def _run_job(
     except Exception as error:
         registry.mark_failed(job_id, error)
         return
-    registry.mark_done(job_id, bundle)
     if on_completed is not None:
-        on_completed(job_id, bundle)
+        try:
+            on_completed(job_id, bundle)
+        except Exception as error:  # A completed investigation must not be hidden by an integration callback.
+            registry.emit(
+                job_id,
+                "automation",
+                "failed",
+                "Post-investigation automation stopped",
+                detail={"error": f"{type(error).__name__}: {error}"},
+            )
+    registry.mark_done(job_id, bundle)
+
+
+def _continue_yolo_from_jira(
+    registry: JobRegistry,
+    job_id: str,
+    bundle: RunBundle,
+    issue_key: str,
+    source: object,
+    config: APIConfig,
+    fix_registry: FixJobRegistry,
+    publication_registry: PublicationJobRegistry,
+    fix_executor: ThreadPoolExecutor,
+    publication_executor: ThreadPoolExecutor,
+    publisher: PullRequestPublisherRunner,
+    yolo_requested: bool,
+) -> None:
+    """Queue the remainder of a Jira workflow only after explicit YOLO-mode consent."""
+    if not yolo_requested:
+        registry.emit(job_id, "yolo", "skipped", "YOLO was off when this Jira ticket was accepted")
+        return
+    if bundle.verdict.status != VerdictStatus.REPRODUCED:
+        registry.emit(job_id, "yolo", "skipped", "YOLO stopped because the ticket was not reproduced")
+        return
+    if not isinstance(source, GitHubProjectSource) or config.github is None:
+        registry.emit(job_id, "yolo", "failed", "YOLO could not find a publishable GitHub mapping")
+        _post_yolo_failure_comment(config, issue_key, "repository mapping", "This Jira project is not mapped to a publishable GitHub repository.")
+        return
+    repository = source_from_jira(source)
+    if not isinstance(repository, GitHubRepositorySource):
+        registry.emit(job_id, "yolo", "failed", "YOLO could not create a GitHub source from the Jira mapping")
+        _post_yolo_failure_comment(config, issue_key, "repository mapping", "The mapped repository source cannot create a GitHub draft pull request.")
+        return
+    try:
+        config.github.require_publish_access(repository.repository)
+    except GitHubCheckoutError as error:
+        registry.emit(job_id, "yolo", "failed", "YOLO GitHub publication setup needs review", detail={"error": str(error)})
+        _post_yolo_failure_comment(config, issue_key, "GitHub publication setup", str(error))
+        return
+    run = RunStore(config.runs_root).get_run(str(bundle.run_id))
+    if run is None:
+        registry.emit(job_id, "yolo", "failed", "YOLO could not load the completed evidence bundle")
+        _post_yolo_failure_comment(config, issue_key, "fix preparation", "The completed evidence bundle could not be loaded.")
+        return
+    try:
+        registry.emit(job_id, "yolo", "started", "YOLO is validating a fix before it can open a draft PR")
+        request = FixPreparationRequest(repository=repository, base_branch=repository.ref)
+        job = fix_registry.create(str(bundle.run_id))
+        fix_executor.submit(
+            _run_fix_job,
+            fix_registry,
+            job.job_id,
+            run,
+            request,
+            config,
+            lambda plan: _queue_yolo_publication(
+                plan,
+                run,
+                issue_key,
+                config,
+                publication_registry,
+                publication_executor,
+                publisher,
+            ),
+            lambda error: _post_yolo_failure_comment(config, issue_key, "fix validation", str(error)),
+        )
+        registry.emit(
+            job_id,
+            "yolo",
+            "completed",
+            "YOLO fix validation queued; GitHub publication will follow only after validation passes",
+            detail={"fix_job_id": job.job_id},
+        )
+    except Exception as error:
+        registry.emit(
+            job_id,
+            "yolo",
+            "failed",
+            "YOLO could not start fix validation",
+            detail={"error": f"{type(error).__name__}: {error}"},
+        )
+        _post_yolo_failure_comment(config, issue_key, "fix preparation", f"{type(error).__name__}: {error}")
+
+
+def _queue_yolo_publication(
+    plan: PullRequestPlan,
+    run: dict[str, object],
+    issue_key: str,
+    config: APIConfig,
+    registry: PublicationJobRegistry,
+    executor: ThreadPoolExecutor,
+    publisher: PullRequestPublisherRunner,
+) -> None:
+    job, created = registry.create(str(plan.run_id), str(plan.plan_id))
+    if not created:
+        return
+    executor.submit(
+        _run_publication_job,
+        registry,
+        job.job_id,
+        plan,
+        run,
+        config,
+        publisher,
+        lambda error: _post_yolo_failure_comment(config, issue_key, "draft pull-request publication", str(error)),
+    )
+
+
+def _post_yolo_failure_comment(config: APIConfig, issue_key: str, stage: str, detail: str) -> None:
+    """Leave Jira with the automation outcome when a later autonomous step cannot continue."""
+    if config.jira is None:
+        return
+    message = "\n".join(
+        (
+            "DevSleuthAgent autonomous workflow stopped",
+            "",
+            f"Stage: {stage}",
+            f"Result: {detail}",
+            "No draft pull request was created by this run.",
+        )
+    )
+    try:
+        JiraCloudClient(config.jira).post_comment(issue_key, message)
+    except Exception:
+        # The primary job already retains the failure; never hide it behind a secondary comment error.
+        return
+
+
+def _run_fix_job(
+    registry: FixJobRegistry,
+    job_id: str,
+    run: dict[str, object],
+    request: FixPreparationRequest,
+    config: APIConfig,
+    on_completed: Callable[[PullRequestPlan], None] | None = None,
+    on_failed: Callable[[Exception], None] | None = None,
+) -> None:
+    """Generate and validate a patch off the event loop; never publish it."""
+    registry.mark_running(job_id)
+    try:
+        if config.github is None:
+            raise GitHubCheckoutError("GitHub configuration is required for fix preparation.")
+        ticket_json = run["ticket"]
+        candidates_json = run["candidates"]
+        manifest = run["manifest"]
+        if not isinstance(ticket_json, dict) or not isinstance(candidates_json, list) or not candidates_json or not isinstance(manifest, dict):
+            raise ValueError("Stored bundle is missing ticket, candidate, or manifest data.")
+        ticket = Ticket(**ticket_json)
+        candidate = _candidate_from_json(candidates_json[0])
+        base_commit = str(manifest["repo_commit"])
+        run_id = UUID(str(manifest["run_id"]))
+
+        registry.emit(job_id, "repository_checkout", "started", "Cloning the reproduced GitHub branch")
+        with resolve_checkout(request.repository, config.github) as resolved:
+            if resolved.commit != base_commit:
+                raise ValueError(
+                    "The target branch no longer matches the reproduced commit; investigate and validate again before preparing a fix."
+                )
+            registry.emit(job_id, "repository_checkout", "completed", "Reproduced GitHub commit pinned")
+            registry.emit(job_id, "patch_generation", "started", "Generating a minimal source-only patch")
+            proposal = ResponsesFixClient.from_environment(model=config.model).propose(
+                ticket,
+                ReadOnlyRepository(resolved.root),
+                candidate,
+            )
+            registry.emit(job_id, "patch_generation", "completed", "Source-only patch proposed")
+            validated = PatchValidator(
+                SandboxPolicy(image=config.sandbox_image, timeout_seconds=config.sandbox_timeout_seconds)
+            ).validate(
+                resolved.root,
+                base_commit=base_commit,
+                proposal=proposal,
+                reproduction=candidate,
+                progress=lambda stage, state, label: registry.emit(job_id, stage, state, label),
+            )
+        registry.emit(job_id, "pr_plan", "started", "Writing the validated local PR plan")
+        plan = prepare_pull_request(
+            validated,
+            run_id=run_id,
+            ticket=ticket,
+            repository=request.repository.repository,
+            base_branch=request.base_branch,
+        )
+        destination = _prepared_plan_path(config.runs_root, str(plan.plan_id))
+        write_pull_request_plan(plan, destination)
+    except Exception as error:
+        registry.mark_failed(job_id, error)
+        if on_failed is not None:
+            on_failed(error)
+        return
+    registry.mark_done(job_id, plan_id=str(plan.plan_id), plan_path=str(destination))
+    if on_completed is not None:
+        on_completed(plan)
+
+
+def _run_publication_job(
+    registry: PublicationJobRegistry,
+    job_id: str,
+    plan: PullRequestPlan,
+    run: dict[str, object],
+    config: APIConfig,
+    publisher: PullRequestPublisherRunner,
+    on_failed: Callable[[Exception], None] | None = None,
+) -> None:
+    """Publish one already-validated plan after a separate explicit API confirmation."""
+    registry.mark_running(job_id)
+    try:
+        if config.github is None:
+            raise GitHubCheckoutError("GitHub configuration is required to publish a pull request.")
+        registry.emit(
+            job_id,
+            "github_publish",
+            "started",
+            "Rechecking the pinned base commit, pushing the validated branch, and opening a draft PR",
+        )
+        published = publisher(plan, config.github)
+        publication = _publication_record(plan, published)
+        _write_publication_record(config.runs_root, plan, publication)
+        registry.emit(job_id, "github_publish", "completed", "Draft pull request opened on GitHub")
+        _post_jira_pull_request_comment(registry, job_id, run, plan, publication, config)
+        _write_publication_record(config.runs_root, plan, publication)
+    except Exception as error:
+        registry.mark_failed(job_id, error)
+        if on_failed is not None:
+            on_failed(error)
+        return
+    registry.mark_done(job_id, publication)
+
+
+def _post_jira_pull_request_comment(
+    registry: PublicationJobRegistry,
+    job_id: str,
+    run: dict[str, object],
+    plan: PullRequestPlan,
+    publication: dict[str, object],
+    config: APIConfig,
+) -> None:
+    ticket_json = run.get("ticket")
+    if not isinstance(ticket_json, dict):
+        publication["jira_comment"] = {"status": "not_applicable"}
+        return
+    ticket_id = ticket_json.get("id")
+    if not isinstance(ticket_id, str) or not _is_configured_jira_ticket(config.jira, ticket_id):
+        publication["jira_comment"] = {"status": "not_applicable"}
+        return
+    pull_request = publication["pull_request"]
+    if not isinstance(pull_request, dict):
+        raise ValueError("Published pull-request record is malformed.")
+    try:
+        registry.emit(job_id, "jira_comment", "started", "Posting the draft pull-request link to Jira")
+        JiraCloudClient(config.jira).post_comment(
+            ticket_id,
+            format_pull_request_comment(
+                ticket_id=ticket_id,
+                run_id=str(plan.run_id),
+                pull_request_url=str(pull_request["url"]),
+                branch=str(pull_request["branch"]),
+                commit=str(pull_request["commit"]),
+            ),
+        )
+    except Exception as error:
+        publication["jira_comment"] = {"status": "failed", "error": f"{type(error).__name__}: {error}"}
+        registry.emit(job_id, "jira_comment", "failed", "Draft PR was opened, but the Jira comment could not be posted")
+    else:
+        publication["jira_comment"] = {"status": "posted", "issue_key": ticket_id}
+        registry.emit(job_id, "jira_comment", "completed", "Draft PR link posted to Jira")
 
 
 def _job_response(job: JobSnapshot) -> dict[str, object]:
@@ -360,6 +865,242 @@ def _job_response(job: JobSnapshot) -> dict[str, object]:
     if job.error:
         payload["error"] = job.error
     return payload
+
+
+def _fix_job_response(job: FixJob) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "job_id": job.job_id,
+        "run_id": job.run_id,
+        "status": job.status.value,
+        "created_at": job.created_at.isoformat(),
+        "updated_at": job.updated_at.isoformat(),
+        "status_url": f"/fixes/{job.job_id}",
+        "published": False,
+        "progress": {
+            "stage": job.current_stage,
+            "state": job.current_state,
+            "label": job.current_label,
+        },
+        "events": [
+            {
+                "sequence": event.sequence,
+                "stage": event.stage,
+                "state": event.state,
+                "label": event.label,
+                "occurred_at": event.occurred_at.isoformat(),
+            }
+            for event in job.events
+        ],
+    }
+    if job.plan_id:
+        payload["plan_id"] = job.plan_id
+        payload["plan_url"] = f"/pull-request-plans/{job.plan_id}"
+    if job.error:
+        payload["error"] = job.error
+    return payload
+
+
+def _publication_job_response(job: PublicationJob) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "job_id": job.job_id,
+        "run_id": job.run_id,
+        "plan_id": job.plan_id,
+        "status": job.status.value,
+        "created_at": job.created_at.isoformat(),
+        "updated_at": job.updated_at.isoformat(),
+        "status_url": f"/pull-request-publications/{job.job_id}",
+        "progress": {
+            "stage": job.current_stage,
+            "state": job.current_state,
+            "label": job.current_label,
+        },
+        "events": [
+            {
+                "sequence": event.sequence,
+                "stage": event.stage,
+                "state": event.state,
+                "label": event.label,
+                "occurred_at": event.occurred_at.isoformat(),
+            }
+            for event in job.events
+        ],
+    }
+    if job.publication is not None:
+        payload["publication"] = job.publication
+    if job.error:
+        payload["error"] = job.error
+    return payload
+
+
+def _validate_fix_request_source(run: dict[str, object], request: FixPreparationRequest) -> None:
+    ticket = run.get("ticket")
+    if not isinstance(ticket, dict) or not isinstance(ticket.get("repo_ref"), str):
+        raise ValueError("Stored bundle does not identify its reproduced GitHub source.")
+    expected_ref = f"{request.repository.repository}@{request.base_branch}"
+    if request.repository.ref != request.base_branch:
+        raise ValueError("repository.ref and base_branch must be the same immutable validation branch.")
+    if ticket["repo_ref"] != expected_ref:
+        raise ValueError("Fix preparation must target the same GitHub repository and branch that was reproduced.")
+
+
+def _prepared_plan_path(runs_root: Path, plan_id: str) -> Path:
+    try:
+        canonical_id = str(UUID(plan_id))
+    except ValueError as error:
+        raise ValueError("Prepared pull-request plan ID is invalid.") from error
+    root = (runs_root.parent / "prepared-prs").resolve()
+    target = (root / f"{canonical_id}.json").resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as error:
+        raise ValueError("Prepared pull-request plan path escapes its configured root.") from error
+    return target
+
+
+def _read_pull_request_plan(runs_root: Path, plan_id: str) -> PullRequestPlan:
+    path = _prepared_plan_path(runs_root, plan_id)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise FileNotFoundError("Prepared pull-request plan not found.") from error
+    if not isinstance(payload, dict):
+        raise FixValidationError("Prepared pull-request plan is invalid.")
+    return PullRequestPlan.from_json(payload)
+
+
+def _publication_record_path(runs_root: Path, plan_id: str) -> Path:
+    try:
+        canonical_id = str(UUID(plan_id))
+    except ValueError as error:
+        raise ValueError("Prepared pull-request plan ID is invalid.") from error
+    root = (runs_root.parent / "published-prs").resolve()
+    target = (root / f"{canonical_id}.json").resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as error:
+        raise ValueError("Published pull-request record path escapes its configured root.") from error
+    return target
+
+
+def _publication_for_plan(runs_root: Path, plan_id: str) -> dict[str, object] | None:
+    try:
+        path = _publication_record_path(runs_root, plan_id)
+    except ValueError:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _publication_record(plan: PullRequestPlan, published: PublishedPullRequest) -> dict[str, object]:
+    return {
+        "plan_id": str(plan.plan_id),
+        "run_id": str(plan.run_id),
+        "repository": published.repository,
+        "published_at": datetime.now(timezone.utc).isoformat(),
+        "pull_request": {
+            "number": published.number,
+            "url": published.url,
+            "branch": published.branch,
+            "commit": published.commit,
+            "draft": True,
+        },
+        "jira_comment": {"status": "pending"},
+    }
+
+
+def _write_publication_record(runs_root: Path, plan: PullRequestPlan, publication: dict[str, object]) -> Path:
+    destination = _publication_record_path(runs_root, str(plan.plan_id))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(".tmp")
+    temporary.write_text(json.dumps(publication, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(destination)
+    return destination
+
+
+def _is_configured_jira_ticket(config: JiraConfig | None, ticket_id: str) -> bool:
+    project_key, separator, sequence = ticket_id.partition("-")
+    return bool(config is not None and separator and sequence and project_key in config.project_sources)
+
+
+def _publication_capability(config: GitHubConfig | None, repository: str) -> dict[str, object]:
+    if config is None:
+        return {"available": False, "reason": "GitHub publishing is not configured for this service."}
+    try:
+        config.require_publish_access(repository)
+    except GitHubCheckoutError as error:
+        return {"available": False, "reason": str(error)}
+    return {"available": True}
+
+
+def _yolo_capability(config: APIConfig) -> dict[str, object]:
+    if config.jira is None:
+        return {"available": False, "reason": "Configure Jira intake before enabling YOLO mode."}
+    if config.github is None:
+        return {"available": False, "reason": "Configure a GitHub write token and draft-PR publishing before enabling YOLO mode."}
+    github_sources = [source for source in config.jira.project_sources.values() if isinstance(source, GitHubProjectSource)]
+    if not github_sources:
+        return {"available": False, "reason": "Map at least one Jira project to an allow-listed GitHub repository before enabling YOLO mode."}
+    for source in github_sources:
+        try:
+            config.github.require_publish_access(source.source.repository)
+        except GitHubCheckoutError as error:
+            return {"available": False, "reason": str(error)}
+    return {"available": True}
+
+
+def _prepared_plan_for_run(runs_root: Path, run_id: str) -> dict[str, object] | None:
+    try:
+        canonical_run_id = str(UUID(run_id))
+    except ValueError:
+        return None
+    root = (runs_root.parent / "prepared-prs").resolve()
+    if not root.is_dir():
+        return None
+    for path in sorted(root.glob("*.json"), reverse=True):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("run_id") == canonical_run_id:
+            return payload
+    return None
+
+
+def _run_summary_with_fix_status(summary: dict[str, object], runs_root: Path) -> dict[str, object]:
+    enriched = dict(summary)
+    run_id = summary.get("run_id")
+    if isinstance(run_id, str):
+        enriched["fix"] = _fix_status_for_run(runs_root, run_id)
+    return enriched
+
+
+def _fix_status_for_run(runs_root: Path, run_id: str) -> dict[str, object] | None:
+    """Return the highest persisted post-reproduction state without overstating deployment."""
+    plan = _prepared_plan_for_run(runs_root, run_id)
+    if plan is None:
+        return None
+    plan_id = plan.get("plan_id")
+    if isinstance(plan_id, str) and (publication := _publication_for_plan(runs_root, plan_id)) is not None:
+        pull_request = publication.get("pull_request")
+        response: dict[str, object] = {
+            "status": "DRAFT_PR_OPEN",
+            "label": "DRAFT PR OPEN",
+            "plan_id": plan_id,
+            "published": True,
+            "jira_comment": publication.get("jira_comment"),
+        }
+        if isinstance(pull_request, dict):
+            response["pull_request"] = pull_request
+        return response
+    return {
+        "status": "FIX_VALIDATED",
+        "label": "FIX VALIDATED",
+        "plan_id": str(plan_id) if isinstance(plan_id, str) else None,
+        "published": False,
+    }
 
 
 def _sse_events(registry: JobRegistry, job_id: str, after_sequence: int) -> Iterator[str]:

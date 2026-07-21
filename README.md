@@ -82,3 +82,4 @@ The optional FastAPI layer starts real investigations asynchronously from either
 - [Evaluation protocol](docs/EVALUATION.md)
 - [Demo and submission plan](docs/SUBMISSION.md)
 - [HTTP API guide](docs/API.md)
+- [Verified fix and gated GitHub PR workflow](docs/github-pr-workflow.md)

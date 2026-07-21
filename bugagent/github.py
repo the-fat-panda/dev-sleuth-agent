@@ -31,16 +31,18 @@ _REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,38})/[A-Za-z0
 
 @dataclass(frozen=True, slots=True)
 class GitHubConfig:
-    """Explicit provider allow-list; a token is optional for public repositories."""
+    """Explicit provider allow-list; publishing is opt-in and disabled by default."""
 
     allowed_repositories: frozenset[str]
     token: str | None = None
+    publish_enabled: bool = False
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str]) -> "GitHubConfig | None":
         raw_allowed = environment.get("BUGAGENT_GITHUB_ALLOWED_REPOSITORIES", "").strip()
         token = environment.get("BUGAGENT_GITHUB_TOKEN", "").strip() or None
-        if not raw_allowed and not token:
+        publish_enabled = _optional_boolean(environment, "BUGAGENT_GITHUB_PR_PUBLISH_ENABLED")
+        if not raw_allowed and not token and not publish_enabled:
             return None
         if not raw_allowed:
             raise GitHubConfigurationError(
@@ -51,13 +53,23 @@ class GitHubConfig:
             raise GitHubConfigurationError(
                 "BUGAGENT_GITHUB_ALLOWED_REPOSITORIES must be a comma-separated owner/repository allow-list."
             )
-        return cls(allowed_repositories=repositories, token=token)
+        return cls(allowed_repositories=repositories, token=token, publish_enabled=publish_enabled)
 
     def require_allowed(self, repository: str) -> None:
         if not _REPOSITORY_PATTERN.fullmatch(repository):
             raise GitHubCheckoutError("GitHub repository must be in owner/repository form.")
         if repository not in self.allowed_repositories:
             raise GitHubCheckoutError(f"GitHub repository {repository!r} is not in BUGAGENT_GITHUB_ALLOWED_REPOSITORIES.")
+
+    def require_publish_access(self, repository: str) -> None:
+        """Reject all remote mutation unless the operator deliberately enabled it."""
+        self.require_allowed(repository)
+        if not self.token:
+            raise GitHubCheckoutError("BUGAGENT_GITHUB_TOKEN is required to publish a pull request.")
+        if not self.publish_enabled:
+            raise GitHubCheckoutError(
+                "GitHub publishing is disabled. Set BUGAGENT_GITHUB_PR_PUBLISH_ENABLED=true only when ready to publish."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +117,15 @@ def validate_git_available(config: GitHubConfig | None) -> None:
 
 def _clone_url(repository: str) -> str:
     return f"https://github.com/{repository}.git"
+
+
+def _optional_boolean(environment: Mapping[str, str], name: str) -> bool:
+    raw = environment.get(name, "").strip().lower()
+    if raw in {"", "false", "0", "no"}:
+        return False
+    if raw in {"true", "1", "yes"}:
+        return True
+    raise GitHubConfigurationError(f"{name} must be true or false when set.")
 
 
 def _run_git(command: list[str], config: GitHubConfig, message: str) -> subprocess.CompletedProcess[str]:

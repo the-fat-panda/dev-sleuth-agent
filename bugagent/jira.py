@@ -248,6 +248,35 @@ def format_investigation_comment(bundle: RunBundle) -> str:
     return "\n".join(lines)
 
 
+def format_pull_request_comment(
+    *,
+    ticket_id: str,
+    run_id: str,
+    pull_request_url: str,
+    branch: str,
+    commit: str,
+) -> str:
+    """Describe the explicitly published, evidence-validated draft PR on Jira."""
+    return "\n".join(
+        (
+            "DevSleuthAgent draft pull request ready",
+            "",
+            f"Ticket: {ticket_id}",
+            f"Evidence run: {run_id}",
+            f"Draft PR: {pull_request_url}",
+            f"Branch: {branch}",
+            f"Commit: {commit}",
+            "",
+            "Validation completed before publication:",
+            "- Regression failed before the patch",
+            "- Regression passed after the patch in the restricted sandbox",
+            "- Repository test suite passed in the restricted sandbox",
+            "",
+            "The pull request is a draft and requires normal code review before merge.",
+        )
+    )
+
+
 def _project_sources(raw: str) -> dict[str, ProjectSource]:
     try:
         decoded = json.loads(raw)

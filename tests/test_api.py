@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
@@ -16,11 +19,27 @@ from bugagent.api import (
     JobRegistry,
     ProgressInvestigationClient,
     ProgressSandbox,
+    _continue_yolo_from_jira,
     create_app,
 )
 from bugagent.artifacts import ArtifactStore
 from bugagent.demo import build_demo_bundle
-from bugagent.domain import RunBundle, Ticket
+from bugagent.domain import RunBundle, Ticket, VerdictStatus
+from bugagent.fix import PublishedPullRequest, PullRequestPlan, write_pull_request_plan
+from bugagent.fix_jobs import FixJobRegistry
+from bugagent.github import GitHubConfig, GitHubSource
+from bugagent.jira import GitHubProjectSource, JiraConfig
+from bugagent.publish_jobs import PublicationJobRegistry
+
+
+class CapturingExecutor:
+    """Test double that proves a background handoff was queued without running it."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, tuple[object, ...]]] = []
+
+    def submit(self, function, *args):
+        self.calls.append((function, args))
 
 
 class BlockingBundleWriter:
@@ -130,6 +149,187 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["detail"], "repository.path must name an existing local directory.")
 
+    def test_fix_preparation_requires_a_reproduced_bundle_before_any_model_or_git_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = replace(build_demo_bundle(), verdict=replace(build_demo_bundle().verdict, status=VerdictStatus.INCONCLUSIVE))
+            ArtifactStore(root / "runs").write(bundle)
+            app = create_app(_config(root / "runs"), startup_validator=lambda _: None, investigation_runner=_unused_runner)
+
+            with TestClient(app) as client:
+                response = client.post(
+                    f"/runs/{bundle.run_id}/fixes",
+                    json={
+                        "repository": {"kind": "github", "repository": "owner/repo", "ref": "main"},
+                        "base_branch": "main",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("REPRODUCED", response.json()["detail"])
+
+    def test_run_endpoints_surface_a_validated_local_fix_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = build_demo_bundle()
+            ArtifactStore(root / "runs").write(bundle)
+            plan_id = uuid4()
+            prepared_plans = root / "prepared-prs"
+            prepared_plans.mkdir()
+            (prepared_plans / f"{plan_id}.json").write_text(
+                json.dumps({"plan_id": str(plan_id), "run_id": str(bundle.run_id)}),
+                encoding="utf-8",
+            )
+            app = create_app(_config(root / "runs"), startup_validator=lambda _: None, investigation_runner=_unused_runner)
+
+            with TestClient(app) as client:
+                listed = client.get("/runs")
+                stored = client.get(f"/runs/{bundle.run_id}")
+                fix_status = client.get(f"/runs/{bundle.run_id}/fix-status")
+
+        expected_fix = {
+            "status": "FIX_VALIDATED",
+            "label": "FIX VALIDATED",
+            "plan_id": str(plan_id),
+            "published": False,
+        }
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()["runs"][0]["fix"], expected_fix)
+        self.assertEqual(stored.status_code, 200)
+        self.assertEqual(stored.json()["fix"], expected_fix)
+        self.assertEqual(fix_status.status_code, 200)
+        self.assertEqual(fix_status.json()["status"], "done")
+        self.assertEqual(fix_status.json()["plan_id"], str(plan_id))
+
+    def test_run_fix_status_surfaces_an_active_background_job(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = build_demo_bundle()
+            ArtifactStore(root / "runs").write(bundle)
+            app = create_app(_config(root / "runs"), startup_validator=lambda _: None, investigation_runner=_unused_runner)
+            app.state.fix_jobs.create(str(bundle.run_id))
+
+            with TestClient(app) as client:
+                response = client.get(f"/runs/{bundle.run_id}/fix-status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "queued")
+        self.assertTrue(response.json()["status_url"].startswith("/fixes/"))
+
+    def test_explicit_publication_creates_a_persisted_draft_pr_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = build_demo_bundle()
+            ArtifactStore(root / "runs").write(bundle)
+            plan = PullRequestPlan(
+                plan_id=uuid4(),
+                run_id=bundle.run_id,
+                repository="owner/repo",
+                base_branch="main",
+                base_commit="a" * 40,
+                head_branch="devsleuth/fix-demo",
+                title="fix: demo",
+                body="Validated local plan.",
+                patch="diff --git a/service.py b/service.py\n",
+                regression_path="tests/bugagent_generated/test_demo.py",
+                regression_content="def test_demo():\n    assert True\n",
+                created_at=datetime.now(timezone.utc),
+            )
+            write_pull_request_plan(plan, root / "prepared-prs" / f"{plan.plan_id}.json")
+            publisher_calls: list[PullRequestPlan] = []
+
+            def fake_publisher(candidate: PullRequestPlan, config: GitHubConfig) -> PublishedPullRequest:
+                publisher_calls.append(candidate)
+                self.assertTrue(config.publish_enabled)
+                return PublishedPullRequest("owner/repo", 42, "https://github.example/pr/42", candidate.head_branch, "b" * 40)
+
+            github = GitHubConfig(frozenset({"owner/repo"}), token="test-token", publish_enabled=True)
+            app = create_app(
+                _config(root / "runs", github=github),
+                startup_validator=lambda _: None,
+                investigation_runner=_unused_runner,
+                pull_request_publisher=fake_publisher,
+            )
+
+            with TestClient(app) as client:
+                rejected = client.post(f"/pull-request-plans/{plan.plan_id}/publish", json={"confirm": False})
+                self.assertEqual(rejected.status_code, 422)
+                accepted = client.post(f"/pull-request-plans/{plan.plan_id}/publish", json={"confirm": True})
+                self.assertEqual(accepted.status_code, 202)
+                completed = _wait_for_state(client, accepted.json()["status_url"], "done")
+                stored_run = client.get(f"/runs/{bundle.run_id}")
+                stored_plan = client.get(f"/pull-request-plans/{plan.plan_id}")
+
+        self.assertEqual(publisher_calls, [plan])
+        self.assertEqual(completed["publication"]["pull_request"]["url"], "https://github.example/pr/42")
+        self.assertEqual(completed["publication"]["jira_comment"]["status"], "not_applicable")
+        self.assertEqual(stored_run.json()["fix"]["status"], "DRAFT_PR_OPEN")
+        self.assertEqual(stored_plan.json()["publication"]["pull_request"]["number"], 42)
+
+    def test_yolo_mode_requires_publish_access_and_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            disabled = create_app(_config(root / "runs"), startup_validator=lambda _: None, investigation_runner=_unused_runner)
+            with TestClient(disabled) as client:
+                self.assertEqual(client.get("/automation/yolo").json()["available"], False)
+                self.assertEqual(client.put("/automation/yolo", json={"enabled": True, "confirm": True}).status_code, 422)
+
+            github = GitHubConfig(frozenset({"owner/repo"}), token="test-token", publish_enabled=True)
+            jira = JiraConfig(
+                base_url="https://example.atlassian.net",
+                email="demo@example.com",
+                api_token="jira-token",
+                webhook_secret="secret",
+                project_sources={
+                    "SCRUM": GitHubProjectSource("owner/repo@main", GitHubSource("owner/repo", "main")),
+                },
+            )
+            enabled = create_app(
+                _config(root / "runs", github=github, jira=jira),
+                startup_validator=lambda _: None,
+                investigation_runner=_unused_runner,
+            )
+            with TestClient(enabled) as client:
+                self.assertEqual(client.get("/automation/yolo").json(), {"enabled": False, "available": True})
+                self.assertEqual(client.put("/automation/yolo", json={"enabled": True, "confirm": False}).status_code, 422)
+                self.assertEqual(client.put("/automation/yolo", json={"enabled": True, "confirm": True}).json()["enabled"], True)
+                self.assertEqual(client.put("/automation/yolo", json={"enabled": False}).json()["enabled"], False)
+
+    def test_yolo_handoff_queues_fix_validation_when_mode_was_enabled_at_jira_intake(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = build_demo_bundle()
+            ArtifactStore(root / "runs").write(bundle)
+            github = GitHubConfig(frozenset({"owner/repo"}), token="test-token", publish_enabled=True)
+            source = GitHubProjectSource("owner/repo@main", GitHubSource("owner/repo", "main"))
+            jobs = JobRegistry()
+            investigation = jobs.create(bundle.ticket, source="jira", issue_key="SCRUM-9")
+            fixes = FixJobRegistry()
+            publications = PublicationJobRegistry()
+            fix_executor = CapturingExecutor()
+            publication_executor = CapturingExecutor()
+
+            _continue_yolo_from_jira(
+                jobs,
+                investigation.job_id,
+                bundle,
+                "SCRUM-9",
+                source,
+                _config(root / "runs", github=github),
+                fixes,
+                publications,
+                fix_executor,
+                publication_executor,
+                lambda _plan, _github: (_ for _ in ()).throw(AssertionError("publisher must not run before validation")),
+                True,
+            )
+
+        self.assertEqual(len(fix_executor.calls), 1)
+        self.assertEqual(len(publication_executor.calls), 0)
+        _, events = jobs.wait_for_events(investigation.job_id, 0, timeout_seconds=0)
+        self.assertIn(("yolo", "started"), [(event.stage, event.state) for event in events])
+        self.assertIn(("yolo", "completed"), [(event.stage, event.state) for event in events])
+
     def test_config_requires_an_image_and_valid_positive_values(self) -> None:
         with self.assertRaisesRegex(APIConfigurationError, "BUGAGENT_SANDBOX_IMAGE"):
             APIConfig.from_environment({})
@@ -181,13 +381,20 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(observed[0].issue_key, "SCRUM-5")
 
 
-def _config(runs_root: Path) -> APIConfig:
+def _config(
+    runs_root: Path,
+    *,
+    github: GitHubConfig | None = None,
+    jira: JiraConfig | None = None,
+) -> APIConfig:
     return APIConfig(
         model="test-model",
         sandbox_image="sha256:" + "a" * 64,
         max_attempts=3,
         sandbox_timeout_seconds=30,
         runs_root=runs_root,
+        github=github,
+        jira=jira,
     )
 
 

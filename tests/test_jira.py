@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -18,6 +19,7 @@ from bugagent.jira import (
     JiraWebhookError,
     JiraWebhookRouter,
     format_investigation_comment,
+    format_pull_request_comment,
     parse_issue_created,
     verify_webhook_signature,
 )
@@ -82,6 +84,19 @@ class JiraTests(unittest.TestCase):
         self.assertIn("Observed result:", comment)
         self.assertIn("What was tried:", comment)
 
+    def test_draft_pull_request_comment_links_the_ticket_to_validated_evidence(self) -> None:
+        comment = format_pull_request_comment(
+            ticket_id="SCRUM-8",
+            run_id="run-8",
+            pull_request_url="https://github.example/owner/repo/pull/42",
+            branch="devsleuth/fix-scrum-8",
+            commit="a" * 40,
+        )
+
+        self.assertIn("DevSleuthAgent draft pull request ready", comment)
+        self.assertIn("Draft PR: https://github.example/owner/repo/pull/42", comment)
+        self.assertIn("Regression passed after the patch", comment)
+
     def test_parser_requires_created_event(self) -> None:
         payload = _webhook_payload()
         payload["webhookEvent"] = "jira:issue_updated"
@@ -115,6 +130,37 @@ class JiraTests(unittest.TestCase):
         self.assertEqual(observed["ticket_id"], "SCRUM-7")
         self.assertEqual(observed["issue_key"], "SCRUM-7")
         self.assertEqual(observed["issue_url"], "https://example.atlassian.net/rest/api/3/issue/10017")
+
+    def test_webhook_captures_yolo_mode_at_ticket_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = _config(Path(directory))
+            app = FastAPI()
+            observed: dict[str, object] = {}
+            attach_jira_routes(
+                app,
+                config,
+                submit=lambda ticket, source, callback, issue: _capture_submission(observed, ticket, source, callback, issue),
+                get_job=lambda job_id: {"job_id": job_id, "status": "queued"},
+                emit_progress=lambda *_args, **_kwargs: None,
+                autonomous_requested=lambda _issue, _source: True,
+                after_completion=lambda _job, _bundle, issue, _source, yolo: observed.update(
+                    {"after_issue": issue.key, "yolo_requested": yolo}
+                ),
+            )
+            raw = json.dumps(_webhook_payload()).encode("utf-8")
+            with patch("bugagent.jira_api.JiraCloudClient.post_comment"), TestClient(app) as client:
+                response = client.post(
+                    "/integrations/jira/webhook",
+                    content=raw,
+                    headers={"x-hub-signature": _signature(config.webhook_secret, raw)},
+                )
+                callback = observed["callback"]
+                assert callable(callback)
+                callback("job-1", build_demo_bundle())
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(observed["after_issue"], "SCRUM-7")
+        self.assertTrue(observed["yolo_requested"])
 
 
 def _config(repo: Path) -> JiraConfig:
@@ -171,6 +217,7 @@ def _capture_submission(observed, ticket, _source, _callback, issue):
     observed["ticket_id"] = ticket.id
     observed["issue_key"] = issue.key
     observed["issue_url"] = issue.source_url
+    observed["callback"] = _callback
     return "job-1"
 
 

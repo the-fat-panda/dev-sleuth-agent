@@ -27,9 +27,10 @@ BugAgent's intended end-to-end behavior is:
 | Jira comments | Live-delivery proven | Jira Cloud REST v3 client posted the structured evidence comment on `SCRUM-5` after its completed `INCONCLUSIVE` verdict. |
 | GitHub repository checkout | Done and live-verified | An allow-listed GitHub source is cloned in the background to a disposable checkout, and `backend-main` on `the-fat-panda/e-commerce` resolved to commit `7adbe54…`. |
 | Repository selection from Jira | GitHub mapping built | `BUGAGENT_JIRA_PROJECT_SOURCES` maps a project key to either a local checkout or an allow-listed GitHub repository/ref. |
-| Fix generation and validation | Not started | No patch schema, disposable patch worktree, or before/after verification gate. |
-| Pull-request creation | Not started | No Git provider client, branch, commit, or PR workflow. |
-| Jira backlink to PR | Not started | Depends on Jira comments and PR creation. |
+| Fix generation and validation | Live-validated locally | Real model-generated Ireland shipping patches passed the fail-before, pass-after, and full-suite gates in restricted disposable sandboxes. No source checkout was modified. |
+| Pull-request creation | Built and workspace-wired; deliberately publish-gated | A validated local plan pins the base commit, branch, patch, regression test, and draft PR body. The UI exposes an explicit Create draft PR action only when a GitHub write token and `BUGAGENT_GITHUB_PR_PUBLISH_ENABLED=true` are configured. The publisher rechecks the base commit, pushes only a `devsleuth/fix-*` branch, and opens a draft PR. It has not been live-published. |
+| Jira backlink to PR | Built; not live-delivered | After a successful draft PR publication, the job posts its URL and validation summary to the mapped Jira ticket. This remains unproven until one real PR is published. |
+| Autonomous Jira-to-draft-PR mode | Built; default off | A local UI YOLO-mode toggle can make future reproduced Jira tickets continue through fix validation, draft PR creation, and Jira backlink without manual UI clicks. It requires explicit GitHub publish configuration and never merges or deploys. |
 | Queue, retries, deployment, observability | Basic demo observability built | The in-memory registry now exposes an activity list, retained live stage events, Jira/manual source metadata, and failure strings in the workspace. Durable queueing, cross-restart history, structured logs, alerts, retry policy, and deployment remain pending. |
 
 ## Completed checkpoints
@@ -54,11 +55,11 @@ The signed Jira webhook endpoint, in-process duplicate-delivery guard, GitHub-ba
 
 ### Phase 7 - Fix agent and sandbox validation
 
-Add a separate, bounded patch-generation loop. A patch may only be generated after a verified reproduction. Each candidate patch must be applied to a disposable worktree and pass this gate: generated regression test fails before the patch, passes after the patch, and the selected existing test suite passes. The checkpoint is a fixture issue repaired without touching the source checkout.
+Completed locally and live-validated: a patch may only be generated after a verified reproduction. Each candidate patch is applied to a disposable worktree and must pass this gate: generated regression test fails before the patch, passes after the patch, and the selected existing test suite passes. The checkpoint repaired the Ireland shipping fixture without touching the source checkout.
 
 ### Phase 8 - Pull request and Jira backlink
 
-Add a least-privilege Git provider adapter to create a branch, commit the accepted patch, open a PR, and send its URL plus evidence summary to Jira. The checkpoint is an end-to-end fixture run that creates a reviewable PR and leaves a Jira comment with the PR link.
+The least-privilege Git provider adapter, explicit UI approval, draft-PR background job, Jira backlink, and opt-in YOLO mode are built. The remaining checkpoint is one live, explicitly approved fixture run that creates a reviewable draft PR and leaves the Jira comment with its link.
 
 ### Phase 9 - Production controls and evaluation
 

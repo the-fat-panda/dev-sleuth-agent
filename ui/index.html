@@ -13,11 +13,18 @@
         <span class="brand-mark" aria-hidden="true"></span>
         <span>DevSleuthAgent</span>
       </a>
-      <nav class="app-nav" aria-label="Workspace navigation">
-        <button class="nav-link is-active" type="button" data-view-target="submit">New investigation</button>
-        <button class="nav-link" type="button" data-view-target="activity">Activity</button>
-        <button class="nav-link" type="button" data-view-target="history">History</button>
-      </nav>
+      <div class="app-header-actions">
+        <nav class="app-nav" aria-label="Workspace navigation">
+          <button class="nav-link is-active" type="button" data-view-target="submit">New investigation</button>
+          <button class="nav-link" type="button" data-view-target="activity">Activity</button>
+          <button class="nav-link" type="button" data-view-target="history">History</button>
+        </nav>
+        <label class="yolo-toggle" for="yolo-mode" title="Autonomously validate fixes, create draft pull requests, and comment Jira for future reproduced Jira tickets.">
+          <input id="yolo-mode" type="checkbox" role="switch" disabled />
+          <span class="yolo-toggle-track" aria-hidden="true"></span>
+          <span><strong>YOLO mode</strong><small id="yolo-mode-status">Checking GitHub publishing setup</small></span>
+        </label>
+      </div>
     </header>
 
     <main class="app-shell">
@@ -127,6 +134,11 @@
               <div><strong>Updating Jira</strong><span>Posting the evidence verdict back to the source ticket</span></div>
               <small>Waiting</small>
             </li>
+            <li class="stage" data-stage="yolo">
+              <span class="stage-marker" aria-hidden="true"></span>
+              <div><strong>Autonomous follow-through</strong><span>When YOLO was enabled at intake, queue fix validation and draft-PR publication</span></div>
+              <small>Waiting</small>
+            </li>
           </ol>
           <div id="live-error" class="inline-error" role="alert" hidden></div>
           <div id="live-actions" class="live-actions" hidden>
@@ -139,14 +151,16 @@
       <section id="screen-evidence" class="screen" aria-labelledby="evidence-title" hidden>
         <div class="evidence-toolbar">
           <button class="back-button" type="button" data-view-target="history">Back to history</button>
-          <button class="secondary-button" type="button" data-view-target="submit">New investigation</button>
+          <div class="evidence-actions">
+            <button class="secondary-button" type="button" data-view-target="submit">New investigation</button>
+          </div>
         </div>
         <section id="verdict-hero" class="verdict-hero" aria-labelledby="evidence-title">
-          <div>
+          <div class="verdict-identity">
             <p class="eyebrow">Evidence verdict</p>
             <h1 id="evidence-title">Loading evidence</h1>
-            <p id="verdict-summary" class="verdict-summary"></p>
           </div>
+          <p id="verdict-summary" class="verdict-summary"></p>
           <div class="score-block"><span>Evidence score</span><strong id="evidence-score">—</strong></div>
         </section>
 
@@ -155,29 +169,98 @@
           <div><span>Run ID</span><strong id="evidence-run-id" class="mono-text">—</strong></div>
           <div><span>Repository commit</span><strong id="evidence-commit" class="mono-text">—</strong></div>
         </section>
+        <details class="workflow-accordion" open>
+          <summary><span>Reproduction &amp; fix workflow</span><small>Evidence, validation, and local PR readiness</small></summary>
+          <div class="workflow-content">
+            <details class="workflow-section">
+              <summary class="workflow-section-summary">
+                <div>
+                  <p class="eyebrow">Reproduction</p>
+                  <h2 id="reproduction-workflow-title">Verified evidence</h2>
+                </div>
+                <div class="workflow-section-meta">
+                  <span id="reproduction-workflow-status" class="workflow-section-status is-pending">PENDING</span>
+                  <span class="workflow-section-note">Pinned source · restricted sandbox</span>
+                </div>
+              </summary>
+              <section class="workflow-section-body evidence-details" aria-label="Reproduction evidence details">
+                <details>
+                  <summary>Generated regression test</summary>
+                  <div class="detail-content"><pre><code id="candidate-test">No generated test is available.</code></pre></div>
+                </details>
+                <details>
+                  <summary>Sandbox result</summary>
+                  <div class="detail-content"><pre><code id="sandbox-result">No sandbox output is available.</code></pre></div>
+                </details>
+                <details>
+                  <summary>Grounded expected-value proof</summary>
+                  <div class="detail-content"><pre><code id="grounded-result">This investigation did not use a contract-backed silent-output proof.</code></pre></div>
+                </details>
+                <details>
+                  <summary>Independent replays</summary>
+                  <div class="detail-content"><pre><code id="replay-result">No replay results are available.</code></pre></div>
+                </details>
+                <details>
+                  <summary>Score breakdown</summary>
+                  <div class="detail-content"><ul id="score-breakdown" class="score-breakdown"></ul></div>
+                </details>
+              </section>
+            </details>
 
-        <section class="evidence-details" aria-label="Evidence details">
-          <details>
-            <summary>Generated regression test</summary>
-            <div class="detail-content"><pre><code id="candidate-test">No generated test is available.</code></pre></div>
-          </details>
-          <details>
-            <summary>Sandbox result</summary>
-            <div class="detail-content"><pre><code id="sandbox-result">No sandbox output is available.</code></pre></div>
-          </details>
-          <details>
-            <summary>Grounded expected-value proof</summary>
-            <div class="detail-content"><pre><code id="grounded-result">This investigation did not use a contract-backed silent-output proof.</code></pre></div>
-          </details>
-          <details>
-            <summary>Independent replays</summary>
-            <div class="detail-content"><pre><code id="replay-result">No replay results are available.</code></pre></div>
-          </details>
-          <details>
-            <summary>Score breakdown</summary>
-            <div class="detail-content"><ul id="score-breakdown" class="score-breakdown"></ul></div>
-          </details>
-        </section>
+            <details id="fix-workflow-section" class="workflow-section workflow-section-fix" hidden>
+              <summary class="workflow-section-summary">
+                <div>
+                  <p class="eyebrow">Fix validation</p>
+                  <h2 id="fix-workflow-title">Local PR preparation</h2>
+                </div>
+                <div class="workflow-section-meta">
+                  <span id="fix-workflow-status" class="workflow-section-status is-pending">READY</span>
+                  <span class="workflow-section-note">Local only · never published</span>
+                </div>
+              </summary>
+              <div class="workflow-section-body">
+                <div class="workflow-section-action">
+                  <button id="prepare-fix" class="secondary-button" type="button">Prepare &amp; validate fix</button>
+                  <button id="publish-pr" class="primary-button" type="button" hidden>Create draft PR</button>
+                </div>
+              <div id="fix-message" class="fix-message" role="status" hidden></div>
+              <div id="publish-message" class="fix-message" role="status" hidden></div>
+              <section id="published-pr-card" class="published-pr-card" aria-labelledby="published-pr-title" hidden>
+                <div>
+                  <p class="eyebrow">GitHub publication</p>
+                  <h3 id="published-pr-title">Draft pull request is open</h3>
+                  <p id="published-pr-summary">The validated patch has been published for review.</p>
+                </div>
+                <a id="published-pr-link" class="primary-button" target="_blank" rel="noopener noreferrer">Open draft PR</a>
+              </section>
+              <section id="fix-progress-card" class="fix-progress-card" aria-labelledby="fix-progress-title" hidden>
+                <div class="fix-progress-heading">
+                  <div>
+                    <h3 id="fix-progress-title">Preparing a local fix</h3>
+                    <p id="fix-progress-summary">This work stays in a disposable checkout and cannot publish to GitHub.</p>
+                  </div>
+                  <span id="fix-progress-status" class="history-status">Queued</span>
+                </div>
+                <ol id="fix-stage-list" class="stage-list" aria-live="polite"></ol>
+              </section>
+              <section class="evidence-details" aria-label="Fix validation details">
+                <details id="fix-plan-details" hidden>
+                  <summary>Validated change summary</summary>
+                  <div class="detail-content"><pre><code id="fix-plan-result">No local PR plan has been prepared.</code></pre></div>
+                </details>
+                <details id="fix-diff-details" hidden>
+                  <summary>Validated source diff</summary>
+                  <div class="detail-content"><pre class="git-diff"><code id="fix-diff-result">No validated source diff is available.</code></pre></div>
+                </details>
+                <details id="fix-regression-details" hidden>
+                  <summary>Validated regression test</summary>
+                  <div class="detail-content"><pre><code id="fix-regression-result">No validated regression test is available.</code></pre></div>
+                </details>
+              </section>
+              </div>
+            </details>
+          </div>
+        </details>
       </section>
 
       <section id="screen-activity" class="screen" aria-labelledby="activity-title" hidden>
