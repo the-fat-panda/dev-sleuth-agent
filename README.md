@@ -103,6 +103,8 @@ BUGAGENT_JIRA_WEBHOOK_GATEWAY_PORT
 
 The commands below use PowerShell from the repository root.
 
+For a judge-focused quick start, supported platform statement, credential-free verification path, and optional live integration setup, see [SETUP.md](SETUP.md).
+
 1. Create a virtual environment and install the API extra.
 
 ```powershell
