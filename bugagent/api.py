@@ -41,6 +41,7 @@ from bugagent.fix import (
     PullRequestPlan,
     PullRequestPublisher,
     ResponsesFixClient,
+    propose_and_validate_fix,
     prepare_pull_request,
     write_pull_request_plan,
 )
@@ -379,6 +380,8 @@ def create_app(
                     },
                     "events": [],
                 }
+        if failed := _failed_fix_status_for_run(selected_config.runs_root, run_id):
+            return failed
         return {"run_id": run_id, "status": "not_started"}
 
     @app.get("/pull-request-plans/{plan_id}")
@@ -395,6 +398,23 @@ def create_app(
         if isinstance(repository, str):
             payload["publication_capability"] = _publication_capability(selected_config.github, repository)
         return payload
+
+    @app.get("/pull-request-plans/{plan_id}/publication-status")
+    def get_pull_request_plan_publication_status(plan_id: str) -> dict[str, object]:
+        """Expose an autonomous publication handoff without making a GitHub write."""
+        try:
+            _read_pull_request_plan(selected_config.runs_root, plan_id)
+        except (OSError, ValueError, FixValidationError, json.JSONDecodeError) as error:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+        if publication := _publication_for_plan(selected_config.runs_root, plan_id):
+            return {
+                "plan_id": plan_id,
+                "status": "done",
+                "publication": publication,
+            }
+        if job := publication_registry.get_for_plan(plan_id):
+            return _publication_job_response(job)
+        return {"plan_id": plan_id, "status": "not_started"}
 
     @app.get("/runs/{run_id}/pull-request-plan")
     def get_run_pull_request_plan(run_id: str) -> dict[str, object]:
@@ -617,7 +637,7 @@ def _continue_yolo_from_jira(
     try:
         registry.emit(job_id, "yolo", "started", "YOLO is validating a fix before it can open a draft PR")
         request = FixPreparationRequest(repository=repository, base_branch=repository.ref)
-        job = fix_registry.create(str(bundle.run_id))
+        job = fix_registry.create(str(bundle.run_id), autonomous=True)
         fix_executor.submit(
             _run_fix_job,
             fix_registry,
@@ -729,19 +749,13 @@ def _run_fix_job(
                     "The target branch no longer matches the reproduced commit; investigate and validate again before preparing a fix."
                 )
             registry.emit(job_id, "repository_checkout", "completed", "Reproduced GitHub commit pinned")
-            registry.emit(job_id, "patch_generation", "started", "Generating a minimal source-only patch")
-            proposal = ResponsesFixClient.from_environment(model=config.model).propose(
-                ticket,
-                ReadOnlyRepository(resolved.root),
-                candidate,
-            )
-            registry.emit(job_id, "patch_generation", "completed", "Source-only patch proposed")
-            validated = PatchValidator(
-                SandboxPolicy(image=config.sandbox_image, timeout_seconds=config.sandbox_timeout_seconds)
-            ).validate(
-                resolved.root,
+            validated = propose_and_validate_fix(
+                ResponsesFixClient.from_environment(model=config.model),
+                PatchValidator(SandboxPolicy(image=config.sandbox_image, timeout_seconds=config.sandbox_timeout_seconds)),
+                ticket=ticket,
+                repository=ReadOnlyRepository(resolved.root),
+                repo_root=resolved.root,
                 base_commit=base_commit,
-                proposal=proposal,
                 reproduction=candidate,
                 progress=lambda stage, state, label: registry.emit(job_id, stage, state, label),
             )
@@ -757,6 +771,13 @@ def _run_fix_job(
         write_pull_request_plan(plan, destination)
     except Exception as error:
         registry.mark_failed(job_id, error)
+        if failed_job := registry.get(job_id):
+            try:
+                _write_failed_fix_status(config.runs_root, _fix_job_response(failed_job))
+            except OSError:
+                # The in-memory failure remains available for this process even
+                # if a local disk write is unavailable.
+                pass
         if on_failed is not None:
             on_failed(error)
         return
@@ -876,6 +897,7 @@ def _fix_job_response(job: FixJob) -> dict[str, object]:
         "updated_at": job.updated_at.isoformat(),
         "status_url": f"/fixes/{job.job_id}",
         "published": False,
+        "autonomous": job.autonomous,
         "progress": {
             "stage": job.current_stage,
             "state": job.current_state,
@@ -955,6 +977,47 @@ def _prepared_plan_path(runs_root: Path, plan_id: str) -> Path:
     except ValueError as error:
         raise ValueError("Prepared pull-request plan path escapes its configured root.") from error
     return target
+
+
+def _failed_fix_status_path(runs_root: Path, run_id: str) -> Path:
+    try:
+        canonical_run_id = str(UUID(run_id))
+    except ValueError as error:
+        raise ValueError("Fix status run ID is invalid.") from error
+    root = (runs_root.parent / "fix-failures").resolve()
+    target = (root / f"{canonical_run_id}.json").resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as error:
+        raise ValueError("Fix status path escapes its configured root.") from error
+    return target
+
+
+def _write_failed_fix_status(runs_root: Path, status: dict[str, object]) -> Path:
+    run_id = status.get("run_id")
+    if not isinstance(run_id, str) or status.get("status") != "failed":
+        raise ValueError("Only a failed fix-job response can be persisted.")
+    destination = _failed_fix_status_path(runs_root, run_id)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(".tmp")
+    temporary.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(destination)
+    return destination
+
+
+def _failed_fix_status_for_run(runs_root: Path, run_id: str) -> dict[str, object] | None:
+    try:
+        destination = _failed_fix_status_path(runs_root, run_id)
+        canonical_run_id = str(UUID(run_id))
+    except ValueError:
+        return None
+    try:
+        payload = json.loads(destination.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("run_id") != canonical_run_id or payload.get("status") != "failed":
+        return None
+    return payload
 
 
 def _read_pull_request_plan(runs_root: Path, plan_id: str) -> PullRequestPlan:
@@ -1080,27 +1143,34 @@ def _run_summary_with_fix_status(summary: dict[str, object], runs_root: Path) ->
 def _fix_status_for_run(runs_root: Path, run_id: str) -> dict[str, object] | None:
     """Return the highest persisted post-reproduction state without overstating deployment."""
     plan = _prepared_plan_for_run(runs_root, run_id)
-    if plan is None:
-        return None
-    plan_id = plan.get("plan_id")
-    if isinstance(plan_id, str) and (publication := _publication_for_plan(runs_root, plan_id)) is not None:
-        pull_request = publication.get("pull_request")
-        response: dict[str, object] = {
-            "status": "DRAFT_PR_OPEN",
-            "label": "DRAFT PR OPEN",
-            "plan_id": plan_id,
-            "published": True,
-            "jira_comment": publication.get("jira_comment"),
+    if plan is not None:
+        plan_id = plan.get("plan_id")
+        if isinstance(plan_id, str) and (publication := _publication_for_plan(runs_root, plan_id)) is not None:
+            pull_request = publication.get("pull_request")
+            response: dict[str, object] = {
+                "status": "DRAFT_PR_OPEN",
+                "label": "DRAFT PR OPEN",
+                "plan_id": plan_id,
+                "published": True,
+                "jira_comment": publication.get("jira_comment"),
+            }
+            if isinstance(pull_request, dict):
+                response["pull_request"] = pull_request
+            return response
+        return {
+            "status": "FIX_VALIDATED",
+            "label": "FIX VALIDATED",
+            "plan_id": str(plan_id) if isinstance(plan_id, str) else None,
+            "published": False,
         }
-        if isinstance(pull_request, dict):
-            response["pull_request"] = pull_request
-        return response
-    return {
-        "status": "FIX_VALIDATED",
-        "label": "FIX VALIDATED",
-        "plan_id": str(plan_id) if isinstance(plan_id, str) else None,
-        "published": False,
-    }
+    if failed := _failed_fix_status_for_run(runs_root, run_id):
+        return {
+            "status": "FIX_NEEDS_REVIEW",
+            "label": "FIX NEEDS REVIEW",
+            "published": False,
+            "error": failed.get("error"),
+        }
+    return None
 
 
 def _sse_events(registry: JobRegistry, job_id: str, after_sequence: int) -> Iterator[str]:

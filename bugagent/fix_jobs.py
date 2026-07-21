@@ -32,6 +32,7 @@ class FixJob:
     status: FixJobState
     created_at: datetime
     updated_at: datetime
+    autonomous: bool = False
     plan_id: str | None = None
     plan_path: str | None = None
     error: str | None = None
@@ -48,10 +49,10 @@ class FixJobRegistry:
         self._jobs: dict[str, FixJob] = {}
         self._lock = Lock()
 
-    def create(self, run_id: str) -> FixJob:
+    def create(self, run_id: str, *, autonomous: bool = False) -> FixJob:
         now = _now()
         event = FixProgressEvent(1, "queued", "queued", "Fix preparation queued", now)
-        job = FixJob(str(uuid4()), run_id, FixJobState.QUEUED, now, now, events=(event,))
+        job = FixJob(str(uuid4()), run_id, FixJobState.QUEUED, now, now, autonomous=autonomous, events=(event,))
         with self._lock:
             self._jobs[job.job_id] = job
         return job

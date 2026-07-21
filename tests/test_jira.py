@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import hmac
 import json
@@ -12,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from bugagent.demo import build_demo_bundle
+from bugagent.domain import Confidence, Verdict, VerdictStatus
 from bugagent.jira_api import attach_jira_routes
 from bugagent.jira import (
     JiraConfig,
@@ -83,6 +85,43 @@ class JiraTests(unittest.TestCase):
         self.assertIn("Candidate test:", comment)
         self.assertIn("Observed result:", comment)
         self.assertIn("What was tried:", comment)
+
+    def test_not_reproduced_comment_explains_attempts_instead_of_only_the_rubric(self) -> None:
+        reproduced = build_demo_bundle()
+        generated_test_failure = replace(
+            reproduced.evidence[0],
+            failure_origin="generated_test",
+            relevant_frame_matches=False,
+            symptom_matches=False,
+        )
+        final_pass = replace(
+            reproduced.evidence[0],
+            attempt=2,
+            exit_code=0,
+            test_failed=False,
+            normalized_signature=None,
+            failure_origin=None,
+            relevant_frame_matches=False,
+            symptom_matches=False,
+        )
+        bundle = replace(
+            reproduced,
+            evidence=(generated_test_failure, reproduced.evidence[1], final_pass),
+            verdict=Verdict(
+                VerdictStatus.NOT_REPRODUCED,
+                Confidence.HIGH,
+                0,
+                ("The observed failure cannot be treated as a product-bug reproduction.",),
+            ),
+        )
+
+        comment = format_investigation_comment(bundle)
+
+        self.assertIn("Generated and ran 2 focused scenarios", comment)
+        self.assertIn("failure was in the generated test rather than a repository code frame", comment)
+        self.assertIn("completed without the reported behavior", comment)
+        self.assertIn("no reproducible application-level failure was verified", comment)
+        self.assertNotIn("Observed result:", comment)
 
     def test_draft_pull_request_comment_links_the_ticket_to_validated_evidence(self) -> None:
         comment = format_pull_request_comment(

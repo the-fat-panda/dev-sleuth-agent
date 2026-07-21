@@ -450,9 +450,15 @@ function pollFixPreparation(job, button, message) {
       button.disabled = false;
       button.textContent = 'Prepare & validate fix';
       if (current.status === 'done') {
-        message.textContent = 'Validated local PR plan is ready. It has not been published to GitHub.';
-        if (current.plan_url) showFixPlan(await api(current.plan_url));
-        announce('Validated local pull-request plan is ready and has not been published.');
+        if (current.plan_url) {
+          showFixPlan(await api(current.plan_url), { autonomous: Boolean(current.autonomous) });
+        }
+        message.textContent = current.autonomous
+          ? 'Validated local PR plan is ready. YOLO is now creating the draft pull request.'
+          : 'Validated local PR plan is ready. It has not been published to GitHub.';
+        announce(current.autonomous
+          ? 'Validated local pull-request plan is ready. Autonomous draft PR publication has started.'
+          : 'Validated local pull-request plan is ready and has not been published.');
       } else {
         message.textContent = `Fix preparation did not validate. ${current.error || 'Review the job details.'}`;
       }
@@ -469,7 +475,8 @@ function pollFixPreparation(job, button, message) {
 
 const fixStages = [
   ['repository_checkout', 'Pin reproduced commit', 'Clone the exact GitHub branch and verify the reproduced commit.'],
-  ['patch_generation', 'Generate source fix', 'Ask the model for one minimal source-only Git diff.'],
+  ['patch_generation', 'Generate source fix', 'Ask the model for one bounded, line-addressed source edit.'],
+  ['patch_preflight', 'Verify patch applies', 'Build and check the deterministic patch before using a sandbox run.'],
   ['regression_before', 'Prove failure before patch', 'Run the verified regression in the restricted sandbox.'],
   ['patch_apply', 'Apply fix in isolation', 'Apply the proposed diff only in a disposable checkout.'],
   ['regression_after', 'Prove fix after patch', 'Run the same regression again and require it to pass.'],
@@ -486,7 +493,9 @@ function renderFixProgress(job) {
   card.hidden = false;
   dom('fix-progress-title').textContent = job.status === 'done' ? 'Local fix plan validated' : job.status === 'failed' ? 'Fix preparation needs review' : 'Preparing a local fix';
   dom('fix-progress-summary').textContent = job.status === 'done'
-    ? 'The source patch, regression test, and suite gate passed in disposable sandboxes. Nothing has been published to GitHub.'
+    ? job.autonomous
+      ? 'The source patch, regression test, and suite gate passed in disposable sandboxes. YOLO is handing the validated plan to draft-PR publication.'
+      : 'The source patch, regression test, and suite gate passed in disposable sandboxes. Nothing has been published to GitHub.'
     : job.status === 'failed'
       ? (job.error || 'The fix did not pass a required validation gate. No GitHub changes were made.')
       : (progress.label || 'Preparing a verified fix in a disposable checkout.');
@@ -499,7 +508,13 @@ function renderFixProgress(job) {
   fixStages.forEach(([id, title, description]) => {
     const matching = events.filter((event) => event.stage === id);
     const latest = matching[matching.length - 1];
-    const state = latest?.state === 'completed' ? 'complete' : latest?.state === 'started' ? 'active' : job.status === 'failed' && progress.stage === id ? 'failed' : 'waiting';
+    const state = latest?.state === 'completed'
+      ? 'complete'
+      : latest?.state === 'started'
+        ? 'active'
+        : latest?.state === 'failed' || (job.status === 'failed' && progress.stage === id)
+          ? 'failed'
+          : 'waiting';
     const row = document.createElement('li');
     row.className = `stage ${state === 'complete' ? 'is-complete' : state === 'active' ? 'is-active' : state === 'failed' ? 'is-failed' : ''}`;
     row.innerHTML = '<span class="stage-marker" aria-hidden="true"></span><div><strong></strong><span></span></div><small></small>';
@@ -530,7 +545,18 @@ async function loadExistingFixPlan(run) {
         ...job,
         events: job.events?.length ? job.events : fixStages.map(([stage]) => ({ stage, state: 'completed' })),
       });
-      showFixPlan(await api(job.plan_url));
+      showFixPlan(await api(job.plan_url), { autonomous: Boolean(job.autonomous) });
+      return;
+    }
+    if (job.status === 'failed') {
+      const button = dom('prepare-fix');
+      const message = dom('fix-message');
+      button.disabled = false;
+      button.textContent = 'Prepare & validate fix';
+      message.hidden = false;
+      message.textContent = `Fix preparation needs review. ${job.error || 'No GitHub change was made.'}`;
+      renderFixProgress(job);
+      setWorkflowStatus('fix-workflow-status', 'NEEDS REVIEW', 'review');
     }
   } catch (_) {
     // A reproduced run does not need to have a prepared plan yet, and the
@@ -538,7 +564,7 @@ async function loadExistingFixPlan(run) {
   }
 }
 
-function showFixPlan(plan) {
+function showFixPlan(plan, { autonomous = false } = {}) {
   state.activePlan = plan;
   const lines = [
     `Target: ${plan.repository}@${plan.base_branch}`,
@@ -559,6 +585,13 @@ function showFixPlan(plan) {
   const publishButton = dom('publish-pr');
   dom('published-pr-card').hidden = true;
   dom('published-pr-link').removeAttribute('href');
+  if (autonomous) {
+    publishButton.hidden = true;
+    publishButton.disabled = true;
+    setWorkflowStatus('fix-workflow-status', 'PUBLISHING DRAFT', 'progress');
+    watchAutonomousPublication(plan);
+    return;
+  }
   const capability = plan.publication_capability || { available: false, reason: 'GitHub publishing is not configured for this service.' };
   publishButton.hidden = false;
   publishButton.disabled = !capability.available;
@@ -570,6 +603,55 @@ function showFixPlan(plan) {
     message.textContent = `${capability.reason} The validated diff remains local and reviewable.`;
   }
   setWorkflowStatus('fix-workflow-status', 'VALIDATED', 'success');
+}
+
+function watchAutonomousPublication(plan) {
+  if (!plan?.plan_id) return;
+  stopPublicationPolling();
+  const session = { timer: null, attempts: 0 };
+  state.publicationPoll = session;
+  const message = dom('publish-message');
+  message.hidden = false;
+  message.textContent = 'YOLO is creating a draft pull request from the validated plan.';
+  const poll = async () => {
+    if (state.publicationPoll !== session) return;
+    try {
+      const current = await api(`/pull-request-plans/${encodeURIComponent(plan.plan_id)}/publication-status`);
+      if (state.publicationPoll !== session) return;
+      if (current.status === 'queued' || current.status === 'running') {
+        renderPublicationProgress(current);
+        session.timer = window.setTimeout(poll, 1200);
+        return;
+      }
+      if (current.status === 'done' && current.publication) {
+        stopPublicationPolling();
+        showPublishedPullRequest(current.publication);
+        message.textContent = 'Draft pull request created. The Jira backlink status is shown below.';
+        announce('Draft pull request created from the validated fix.');
+        return;
+      }
+      if (current.status === 'failed') {
+        stopPublicationPolling();
+        message.textContent = `Autonomous draft pull-request publication stopped. ${current.error || 'No draft PR was created.'}`;
+        setWorkflowStatus('fix-workflow-status', 'NEEDS REVIEW', 'review');
+        return;
+      }
+      session.attempts += 1;
+      if (session.attempts >= 25) {
+        stopPublicationPolling();
+        message.textContent = 'Validated plan is ready, but autonomous draft-PR publication did not start. No GitHub change was made.';
+        setWorkflowStatus('fix-workflow-status', 'NEEDS REVIEW', 'review');
+        return;
+      }
+      session.timer = window.setTimeout(poll, 800);
+    } catch (error) {
+      if (state.publicationPoll !== session) return;
+      stopPublicationPolling();
+      message.textContent = `Unable to read autonomous draft-PR progress. ${error.message}`;
+      setWorkflowStatus('fix-workflow-status', 'NEEDS REVIEW', 'review');
+    }
+  };
+  poll();
 }
 
 function renderGitDiff(patch) {

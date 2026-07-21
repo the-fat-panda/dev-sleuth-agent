@@ -65,6 +65,12 @@ class PublicationJobRegistry:
         with self._lock:
             return self._jobs.get(job_id)
 
+    def get_for_plan(self, plan_id: str) -> PublicationJob | None:
+        """Find the in-process publication for a validated plan, if one exists."""
+        with self._lock:
+            job_id = self._jobs_by_plan.get(plan_id)
+            return self._jobs.get(job_id) if job_id is not None else None
+
     def mark_running(self, job_id: str) -> None:
         self._replace(job_id, status=PublicationJobState.RUNNING, error=None)
         self.emit(job_id, "job", "running", "Publishing validated draft pull request")

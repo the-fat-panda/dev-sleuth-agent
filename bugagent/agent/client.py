@@ -191,21 +191,45 @@ def _candidate_schema() -> dict[str, Any]:
 
 
 _SYSTEM_INSTRUCTIONS = """You investigate a Python bug report and propose exactly one pytest regression test.
-Use only public repository APIs when possible. Do not modify application code. Do not use subprocesses,
-networking, filesystem access, or environment variables in the test. Put the test directly under
-tests/bugagent_generated/. State the expected product failure, not a setup error. If prior feedback
-shows a setup failure, refine the test; do not claim reproduction without sandbox evidence.
+The repository context contains a `Verified API surface` created by static source inspection and
+`Existing verified test usage` copied from the repository's own tests. Treat both as ground truth.
+Before writing the test, identify every import, constructor, public method, and keyword argument you
+will call. Use only an invocation supported by a listed signature or a usage example. Prefer the
+shortest verified public call path; for example, call a documented pricing quote directly rather than
+inventing an application/cart workflow. Never invent constructors, methods, factory helpers, fixtures,
+or keyword arguments. Put the exact verified symbols you use in public_api_claims.
+
+Do not modify application code. Do not use subprocesses, networking, filesystem access, or environment
+variables in the test. Put the test directly under tests/bugagent_generated/. State the expected product
+failure, not a setup error. If prior feedback shows a setup failure, re-check the verified API surface
+and existing usage before refining the test; do not claim reproduction without sandbox evidence.
 
 For a crash or exception bug, set silent_output to null. For a silent wrong-value bug, set silent_output
 to a grounded proof only when repository source explicitly states the expected business rule. Use
 policy_id "tax_after_discounts_v1" only when the repository's mercato/pricing/tax.py contains the exact
 post-discount tax convention. Cite that exact sentence as contract_anchor. Supply integer minor-unit
 inputs subtotal_minor, discount_minor, shipping_minor, decimal tax_rate, and currency; expected_values
-must contain tax_minor and total_minor. Your test must configure the applicable public TaxPolicy rate,
+must contain tax_minor and total_minor, and observed_fields must be the literal array
+["tax_minor", "total_minor"] (never Python attribute expressions). Your test must configure the applicable public TaxPolicy rate,
 assign quote from a public .quote() call, then print exactly one marker before assertions:
 print("BUGAGENT_OBSERVATION " + json.dumps({"tax_minor": quote.tax.minor, "total_minor": quote.total.minor}, sort_keys=True))
 It must assert quote.tax.minor and quote.total.minor against the grounded integer expected values. Do not
-use a silent_output proof if you cannot meet every one of these requirements; return null instead."""
+use a silent_output proof if you cannot meet every one of these requirements; return null instead.
+
+For the documented Mercato free-shipping tiers, use policy_id "free_shipping_tiers_v1" only when
+mercato/pricing/engine.py contains the exact tier contract saying discounted subtotal >= $350 ships free,
+with lower tiers checked from highest threshold downward. Use this exact contract_anchor value:
+"discounted subtotal >= $350 -> shipping is free discounted subtotal >= $250 -> 25% off the shipping fee
+discounted subtotal >= $150 -> 50% off the shipping fee otherwise -> the full shipping fee applies The tiers
+are checked from the highest threshold downward". This narrow proof supports a no-coupon USD quote with
+TaxPolicy(default_rate=Decimal("0")): supply
+subtotal_minor, discount_minor="0", shipping_minor, tax_rate="0", and currency="USD". expected_values
+must contain shipping_minor and total_minor, and observed_fields must be the literal array
+["shipping_minor", "total_minor"] (never Python attribute expressions). Assign quote from PricingEngine.quote([...], shipping=...),
+print exactly one marker before assertions:
+print("BUGAGENT_OBSERVATION " + json.dumps({"shipping_minor": quote.shipping.minor, "total_minor": quote.total.minor}, sort_keys=True))
+and assert quote.shipping.minor and quote.total.minor against the grounded integer expected values. Do
+not use this proof if its exact contract or protocol is unavailable; return null instead."""
 
 
 def _user_prompt(ticket: Ticket, repository: RepositoryContext, prior_feedback: tuple[str, ...]) -> str:

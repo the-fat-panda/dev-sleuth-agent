@@ -52,6 +52,83 @@ class RepositoryTests(unittest.TestCase):
         with self.assertRaises(CandidateValidationError):
             validate_candidate(candidate)
 
+    def test_context_exposes_real_signatures_and_existing_usage_before_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            engine = root / "mercato" / "pricing" / "engine.py"
+            engine.parent.mkdir(parents=True)
+            engine.write_text(
+                '''from __future__ import annotations
+
+class PricingEngine:
+    """Prices lines and an optional shipping fee."""
+
+    def __init__(self, currency: str = "USD") -> None:
+        self.currency = currency
+
+    def quote(self, lines: list[PricingLine], *, shipping: Money | None = None) -> Quote:
+        """Return a price quote for lines and shipping."""
+        raise NotImplementedError
+
+class PricingLine:
+    def __init__(self, sku: str, price: Money) -> None:
+        self.sku = sku
+        self.price = price
+''',
+                encoding="utf-8",
+            )
+            existing = root / "tests" / "test_pricing.py"
+            existing.parent.mkdir()
+            existing.write_text(
+                '''from mercato.money import Money
+from mercato.pricing.engine import PricingEngine, PricingLine
+
+def test_quote_with_shipping():
+    quote = PricingEngine().quote(
+        [PricingLine("A", Money.of("40"))],
+        shipping=Money.of("7.50"),
+    )
+    assert quote.total == Money.of("47.50")
+''',
+                encoding="utf-8",
+            )
+
+            context = ReadOnlyRepository(root).build_context(
+                Ticket(
+                    "SCRUM-1",
+                    "Free shipping tier is wrong",
+                    "Shipping should be waived for the qualifying cart total.",
+                    "mercato@abc",
+                )
+            )
+
+        prompt = context.as_prompt_text()
+        self.assertIn("Verified API surface", prompt)
+        self.assertIn("constructor: PricingEngine(currency: str = 'USD')", prompt)
+        self.assertIn("PricingEngine.quote(self, lines: list[PricingLine], *, shipping: Money | None = None)", prompt)
+        self.assertIn("Prices lines and an optional shipping fee.", prompt)
+        self.assertIn("Existing verified test usage", prompt)
+        self.assertIn("test_quote_with_shipping", prompt)
+        self.assertIn("shipping=Money.of(\"7.50\")", prompt)
+        self.assertIn("mercato/pricing/engine.py", [path for path, _ in context.snippets])
+
+    def test_context_keeps_supported_silent_output_contract_sources_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pricing = root / "mercato" / "pricing"
+            pricing.mkdir(parents=True)
+            (pricing / "tax.py").write_text('"""tax contract"""\n', encoding="utf-8")
+            (pricing / "engine.py").write_text('"""shipping contract"""\n', encoding="utf-8")
+
+            context = ReadOnlyRepository(root).build_context(
+                Ticket("T-2", "Tax is wrong", "A discount changes the tax total.", "mercato@abc")
+            )
+
+        self.assertEqual(
+            [path for path, _ in context.snippets[:2]],
+            ["mercato/pricing/tax.py", "mercato/pricing/engine.py"],
+        )
+
 
 class OrchestratorTests(unittest.TestCase):
     def test_scripted_client_and_sandbox_produce_verified_bundle(self) -> None:
@@ -136,6 +213,8 @@ class ResponsesClientTests(unittest.TestCase):
         self.assertEqual(payload["model"], DEFAULT_MODEL)
         self.assertFalse(payload["store"])
         self.assertTrue(payload["text"]["format"]["strict"])
+        self.assertIn("Verified API surface", payload["input"][0]["content"])
+        self.assertIn("Never invent constructors", payload["input"][0]["content"])
         self.assertEqual(candidate.path, "tests/bugagent_generated/test_close.py")
 
 

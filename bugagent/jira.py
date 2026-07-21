@@ -235,17 +235,66 @@ def format_investigation_comment(bundle: RunBundle) -> str:
                 f"Expected symptom: {candidate.expected_symptom}",
             ]
         )
-    if bundle.evidence:
+    if verdict.status.value == "REPRODUCED" and bundle.evidence:
         observed = next((item for item in bundle.evidence if item.normalized_signature), None)
         if observed and observed.normalized_signature:
             lines.append(f"Observed result: {observed.normalized_signature}")
-    if verdict.rationale:
+    if verdict.status.value != "REPRODUCED":
+        lines.extend(["", "What was tried:"])
+        lines.extend(_non_reproduction_summary(bundle))
+    elif verdict.rationale:
         lines.extend(["", "What was tried:"])
         lines.extend(f"- {item}" for item in verdict.rationale)
     if verdict.blocking_questions:
         lines.extend(["", "Information needed:"])
         lines.extend(f"- {item}" for item in verdict.blocking_questions)
     return "\n".join(lines)
+
+
+def _non_reproduction_summary(bundle: RunBundle) -> tuple[str, ...]:
+    """Explain negative evidence in reporter language without changing its rubric."""
+    candidate_runs = tuple(item for item in bundle.evidence if item.phase == "CANDIDATE")
+    replay_runs = tuple(item for item in bundle.evidence if item.phase == "REPLAY")
+    count = len(candidate_runs) or len(bundle.candidates)
+    scenario_word = "scenario" if count == 1 else "scenarios"
+    lines = [
+        f"- Generated and ran {count} focused {scenario_word} in a restricted sandbox against the pinned repository commit.",
+    ]
+
+    generated_test_failures = tuple(
+        item for item in candidate_runs if item.test_failed and item.failure_origin == "generated_test"
+    )
+    if generated_test_failures:
+        failure_word = "failure" if len(generated_test_failures) == 1 else "failures"
+        lines.append(
+            f"- {len(generated_test_failures)} scenario {failure_word} produced assertion output, but the failure was in the generated test rather than a repository code frame."
+        )
+
+    clean_passes = tuple(
+        item
+        for item in candidate_runs
+        if item.setup_valid and item.test_collected and not item.test_failed and not item.timed_out
+    )
+    if clean_passes:
+        pass_word = "scenario" if len(clean_passes) == 1 else "scenarios"
+        lines.append(
+            f"- {len(clean_passes)} {pass_word} completed without the reported behavior, so it did not reproduce the issue."
+        )
+
+    if replay_runs:
+        lines.append(
+            f"- Ran {len(replay_runs)} independent replay checks; they did not establish a consistent application-code failure matching the report."
+        )
+
+    lines.append(
+        f"- Result: no reproducible application-level failure was verified within the {count}-attempt investigation budget."
+    )
+    if bundle.verdict.blocking_questions:
+        return tuple(lines)
+    lines.append(
+        "- Helpful follow-up: share a cart or order identifier, exact items and quantities, and any promotion, region, or timing detail that makes the behavior repeatable."
+    )
+    return tuple(lines)
 
 
 def format_pull_request_comment(

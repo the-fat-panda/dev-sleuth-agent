@@ -59,6 +59,39 @@ def test_discount_reduces_taxable_amount():
     assert quote.total.minor == 4860
 '''
 
+_FREE_SHIPPING_CONTRACT = '''Free-shipping incentive
+-----------------------
+Larger orders earn a reduced shipping fee, keyed off the *discounted*
+subtotal (subtotal minus any discount):
+
+    discounted subtotal >= $350  ->  shipping is free
+    discounted subtotal >= $250  ->  25% off the shipping fee
+    discounted subtotal >= $150  ->  50% off the shipping fee
+    otherwise                    ->  the full shipping fee applies
+
+The tiers are checked from the highest threshold downward, so an order
+always receives the best incentive it qualifies for.'''
+
+_FREE_SHIPPING_PROBE = '''import json
+from decimal import Decimal
+
+from mercato.money import Money
+from mercato.pricing.engine import PricingEngine, PricingLine
+from mercato.pricing.tax import TaxPolicy
+
+
+def test_qualifying_order_gets_free_shipping():
+    tax_policy = TaxPolicy(default_rate=Decimal("0"))
+    engine = PricingEngine(tax_policy=tax_policy)
+    quote = engine.quote(
+        [PricingLine("SKU", "Qualifying order", Money(40000, "USD"), 1)],
+        shipping=Money(1000, "USD"),
+    )
+    print("BUGAGENT_OBSERVATION " + json.dumps({"shipping_minor": quote.shipping.minor, "total_minor": quote.total.minor}, sort_keys=True))
+    assert quote.shipping.minor == 0
+    assert quote.total.minor == 40000
+'''
+
 
 class ObservingSandbox:
     def run(self, repo_root: Path, candidate_path: Path) -> SandboxRun:
@@ -71,6 +104,19 @@ class ObservingSandbox:
             False,
         )
         return SandboxRun("sha256:" + "c" * 64, preflight, execution, candidate_path.name)
+
+
+class FreeShippingObservingSandbox:
+    def run(self, repo_root: Path, candidate_path: Path) -> SandboxRun:
+        preflight = CommandResult(("docker", "run"), 0, "1 test collected", "", False)
+        execution = CommandResult(
+            ("docker", "run"),
+            1,
+            'BUGAGENT_OBSERVATION {"shipping_minor": 500, "total_minor": 40500}\n',
+            'E AssertionError\ntests/bugagent_generated/test_free_shipping.py:20: AssertionError\n',
+            False,
+        )
+        return SandboxRun("sha256:" + "d" * 64, preflight, execution, candidate_path.name)
 
 
 class SilentOutputTests(unittest.TestCase):
@@ -133,6 +179,36 @@ class SilentOutputTests(unittest.TestCase):
         self.assertTrue(proof.probe_verified)
         self.assertEqual({value.name: value.minor for value in proof.expected_values}, {"tax_minor": 360, "total_minor": 4860})
 
+    def test_grounded_free_shipping_mismatch_is_reproduced_after_two_matching_replays(self) -> None:
+        with _free_shipping_repository() as root:
+            bundle = InvestigationOrchestrator(
+                ScriptedInvestigationClient((_free_shipping_candidate(),)), FreeShippingObservingSandbox()
+            ).investigate(_free_shipping_ticket(), root, "shipping-fixture")
+
+        self.assertEqual(bundle.verdict.status, VerdictStatus.REPRODUCED)
+        proof = bundle.evidence[0].silent_output
+        assert proof is not None
+        self.assertTrue(proof.probe_verified)
+        self.assertEqual(
+            {value.name: value.minor for value in proof.expected_values},
+            {"shipping_minor": 0, "total_minor": 40000},
+        )
+        self.assertEqual(
+            {value.name: value.minor for value in proof.observed_values},
+            {"shipping_minor": 500, "total_minor": 40500},
+        )
+
+    def test_free_shipping_protocol_recovers_omitted_model_metadata(self) -> None:
+        with _free_shipping_repository() as root:
+            bundle = InvestigationOrchestrator(
+                ScriptedInvestigationClient((_free_shipping_candidate(include_proof=False),)), FreeShippingObservingSandbox()
+            ).investigate(_free_shipping_ticket(), root, "shipping-fixture")
+
+        self.assertEqual(bundle.verdict.status, VerdictStatus.REPRODUCED)
+        proof = bundle.evidence[0].silent_output
+        assert proof is not None
+        self.assertEqual(proof.policy_id, "free_shipping_tiers_v1")
+
 
 def _candidate(
     *,
@@ -173,6 +249,45 @@ def _ticket() -> Ticket:
     )
 
 
+def _free_shipping_candidate(*, include_proof: bool = True) -> CandidateTest:
+    return CandidateTest(
+        path="tests/bugagent_generated/test_free_shipping.py",
+        content=_FREE_SHIPPING_PROBE,
+        hypothesis="The highest free-shipping tier is shadowed by lower tiers.",
+        expected_symptom="A $400 qualifying order retains shipping instead of receiving free shipping.",
+        public_api_claims=("PricingEngine", "PricingEngine.quote", "PricingLine", "TaxPolicy"),
+        silent_output=SilentOutputProof(
+            policy_id="free_shipping_tiers_v1",
+            contract_path="mercato/pricing/engine.py",
+            contract_anchor=(
+                "discounted subtotal >= $350 -> shipping is free "
+                "discounted subtotal >= $250 -> 25% off the shipping fee "
+                "discounted subtotal >= $150 -> 50% off the shipping fee "
+                "otherwise -> the full shipping fee applies "
+                "The tiers are checked from the highest threshold downward"
+            ),
+            input_values=(
+                TextValue("subtotal_minor", "40000"),
+                TextValue("discount_minor", "0"),
+                TextValue("shipping_minor", "1000"),
+                TextValue("tax_rate", "0"),
+                TextValue("currency", "USD"),
+            ),
+            expected_values=(MinorValue("shipping_minor", 0), MinorValue("total_minor", 40000)),
+            observed_fields=("shipping_minor", "total_minor"),
+        ) if include_proof else None,
+    )
+
+
+def _free_shipping_ticket() -> Ticket:
+    return Ticket(
+        "SHIP-1",
+        "Shipping remains charged on a qualifying order",
+        "A customer says delivery should be free for a large order, but it is still charged.",
+        "mercato@shipping-fixture",
+    )
+
+
 class _tax_repository:
     def __enter__(self) -> Path:
         self._temporary = tempfile.TemporaryDirectory()
@@ -180,6 +295,19 @@ class _tax_repository:
         tax = root / "mercato" / "pricing" / "tax.py"
         tax.parent.mkdir(parents=True)
         tax.write_text(f'"""{_CONTRACT}"""\n', encoding="utf-8")
+        return root
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self._temporary.cleanup()
+
+
+class _free_shipping_repository:
+    def __enter__(self) -> Path:
+        self._temporary = tempfile.TemporaryDirectory()
+        root = Path(self._temporary.name)
+        engine = root / "mercato" / "pricing" / "engine.py"
+        engine.parent.mkdir(parents=True)
+        engine.write_text(f'"""{_FREE_SHIPPING_CONTRACT}"""\n', encoding="utf-8")
         return root
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:

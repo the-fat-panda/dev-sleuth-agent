@@ -20,6 +20,7 @@ from bugagent.api import (
     ProgressInvestigationClient,
     ProgressSandbox,
     _continue_yolo_from_jira,
+    _write_failed_fix_status,
     create_app,
 )
 from bugagent.artifacts import ArtifactStore
@@ -216,6 +217,33 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["status"], "queued")
         self.assertTrue(response.json()["status_url"].startswith("/fixes/"))
 
+    def test_failed_fix_status_survives_a_service_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = build_demo_bundle()
+            ArtifactStore(root / "runs").write(bundle)
+            _write_failed_fix_status(
+                root / "runs",
+                {
+                    "run_id": str(bundle.run_id),
+                    "status": "failed",
+                    "autonomous": True,
+                    "error": "PatchApplicationError: Patch did not apply cleanly. (error: corrupt patch at line 20)",
+                    "events": [],
+                },
+            )
+            restarted = create_app(_config(root / "runs"), startup_validator=lambda _: None, investigation_runner=_unused_runner)
+
+            with TestClient(restarted) as client:
+                fix_status = client.get(f"/runs/{bundle.run_id}/fix-status")
+                stored = client.get(f"/runs/{bundle.run_id}")
+
+        self.assertEqual(fix_status.status_code, 200)
+        self.assertEqual(fix_status.json()["status"], "failed")
+        self.assertTrue(fix_status.json()["autonomous"])
+        self.assertIn("corrupt patch", fix_status.json()["error"])
+        self.assertEqual(stored.json()["fix"]["status"], "FIX_NEEDS_REVIEW")
+
     def test_explicit_publication_creates_a_persisted_draft_pr_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -259,12 +287,16 @@ class ApiTests(unittest.TestCase):
                 completed = _wait_for_state(client, accepted.json()["status_url"], "done")
                 stored_run = client.get(f"/runs/{bundle.run_id}")
                 stored_plan = client.get(f"/pull-request-plans/{plan.plan_id}")
+                publication_status = client.get(f"/pull-request-plans/{plan.plan_id}/publication-status")
 
         self.assertEqual(publisher_calls, [plan])
         self.assertEqual(completed["publication"]["pull_request"]["url"], "https://github.example/pr/42")
         self.assertEqual(completed["publication"]["jira_comment"]["status"], "not_applicable")
         self.assertEqual(stored_run.json()["fix"]["status"], "DRAFT_PR_OPEN")
         self.assertEqual(stored_plan.json()["publication"]["pull_request"]["number"], 42)
+        self.assertEqual(publication_status.status_code, 200)
+        self.assertEqual(publication_status.json()["status"], "done")
+        self.assertEqual(publication_status.json()["publication"]["pull_request"]["number"], 42)
 
     def test_yolo_mode_requires_publish_access_and_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -326,6 +358,7 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(len(fix_executor.calls), 1)
         self.assertEqual(len(publication_executor.calls), 0)
+        self.assertTrue(fixes.latest_for_run(str(bundle.run_id)).autonomous)
         _, events = jobs.wait_for_events(investigation.job_id, 0, timeout_seconds=0)
         self.assertIn(("yolo", "started"), [(event.stage, event.state) for event in events])
         self.assertIn(("yolo", "completed"), [(event.stage, event.state) for event in events])

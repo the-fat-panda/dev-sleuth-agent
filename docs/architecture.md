@@ -268,7 +268,7 @@ The scorer returns clear negative states rather than pretending certainty:
 - `INCONCLUSIVE` — there was some signal but a disqualifier, unsafe candidate, mismatched replays, or exhausted attempt budget prevented proof.
 - `REPRODUCED` — the complete proof threshold was met.
 
-Silent wrong-value defects are treated specially by `bugagent/silent_output.py`. A generated assertion normally has no independent authority, so the system permits this exception only for a supported, repository-cited business contract (currently the Mercato post-discount tax policy). It verifies the exact contract anchor and hash, validates a tightly constrained public API probe, independently calculates the expected minor-unit values, captures one structured observation, and requires matching replays. This produces grounded evidence rather than self-authored expected values.
+Silent wrong-value defects are treated specially by `bugagent/silent_output.py`. A generated assertion normally has no independent authority, so the system permits this exception only for a supported, repository-cited business contract: currently the Mercato post-discount tax policy and its documented free-shipping tiers. It verifies the exact contract anchor and hash, validates a tightly constrained public API probe, independently calculates the expected minor-unit values, captures one structured observation, and requires matching replays. This produces grounded evidence rather than self-authored expected values.
 
 ### Artifacts and independent replay
 

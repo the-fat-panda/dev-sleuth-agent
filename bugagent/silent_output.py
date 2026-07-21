@@ -21,6 +21,15 @@ _TAX_CONTRACT_ANCHOR = (
     "Mercato's convention is that tax is charged on the amount the customer actually "
     "pays for goods — i.e. the subtotal after order-level discounts and coupons."
 )
+_FREE_SHIPPING_POLICY_ID = "free_shipping_tiers_v1"
+_FREE_SHIPPING_CONTRACT_PATH = "mercato/pricing/engine.py"
+_FREE_SHIPPING_CONTRACT_ANCHOR = (
+    "discounted subtotal >= $350 -> shipping is free "
+    "discounted subtotal >= $250 -> 25% off the shipping fee "
+    "discounted subtotal >= $150 -> 50% off the shipping fee "
+    "otherwise -> the full shipping fee applies "
+    "The tiers are checked from the highest threshold downward"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +43,11 @@ class GroundedSilentOutput:
 
 def ground_silent_output(candidate: CandidateTest, repo_root: Path) -> GroundedSilentOutput | None:
     """Resolve a supplied or statically recoverable claim through a repository contract."""
-    proof = candidate.silent_output or _infer_tax_after_discounts_proof(candidate.content)
+    proof = (
+        candidate.silent_output
+        or _infer_tax_after_discounts_proof(candidate.content)
+        or _infer_free_shipping_tiers_proof(candidate.content)
+    )
     if proof is None:
         return None
     contract_hash: str | None = None
@@ -150,6 +163,68 @@ def _infer_tax_after_discounts_proof(content: str) -> SilentOutputProof | None:
     )
 
 
+def _infer_free_shipping_tiers_proof(content: str) -> SilentOutputProof | None:
+    """Recover a narrow, zero-tax quote protocol for the documented shipping tiers.
+
+    The deterministic oracle accepts no coupons and a public ``TaxPolicy``
+    configured to zero, keeping the claim limited to the shipping contract
+    rather than attempting to interpret all pricing behaviour.
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return None
+    assignments = {
+        target.id: node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    policies = {
+        name: _default_tax_rate(value)
+        for name, value in assignments.items()
+        if isinstance(value, ast.Call) and _call_name(value.func) == "TaxPolicy"
+    }
+    engines = {
+        name: _engine_policy_name(value)
+        for name, value in assignments.items()
+        if isinstance(value, ast.Call) and _call_name(value.func) == "PricingEngine"
+    }
+    quote_call = assignments.get("quote")
+    if not isinstance(quote_call, ast.Call) or not isinstance(quote_call.func, ast.Attribute):
+        return None
+    if quote_call.func.attr != "quote" or not isinstance(quote_call.func.value, ast.Name):
+        return None
+    policy_name = engines.get(quote_call.func.value.id)
+    if policy_name is None or policies.get(policy_name) != Decimal("0"):
+        return None
+    if _keyword_value(quote_call, "coupon") is not None or _keyword_value(quote_call, "coupons") is not None:
+        return None
+    inputs = _free_shipping_inputs(quote_call)
+    if inputs is None:
+        return None
+    subtotal, shipping, currency = inputs
+    shipping_due = _shipping_due(subtotal, shipping)
+    return SilentOutputProof(
+        policy_id=_FREE_SHIPPING_POLICY_ID,
+        contract_path=_FREE_SHIPPING_CONTRACT_PATH,
+        contract_anchor=_FREE_SHIPPING_CONTRACT_ANCHOR,
+        input_values=(
+            TextValue("subtotal_minor", str(subtotal)),
+            TextValue("discount_minor", "0"),
+            TextValue("shipping_minor", str(shipping)),
+            TextValue("tax_rate", "0"),
+            TextValue("currency", currency),
+        ),
+        expected_values=(
+            MinorValue("shipping_minor", shipping_due),
+            MinorValue("total_minor", subtotal + shipping_due),
+        ),
+        observed_fields=("shipping_minor", "total_minor"),
+    )
+
+
 def _default_tax_rate(call: ast.Call) -> Decimal | None:
     for keyword in call.keywords:
         if keyword.arg == "default_rate":
@@ -183,6 +258,37 @@ def _quote_inputs(call: ast.Call) -> tuple[int, int, int, str] | None:
     if shipping is None:
         return None
     return subtotal, subtotal * coupon // 100, shipping, currencies.pop()
+
+
+def _free_shipping_inputs(call: ast.Call) -> tuple[int, int, str] | None:
+    lines_node = call.args[0] if call.args else _keyword_value(call, "lines")
+    if not isinstance(lines_node, (ast.List, ast.Tuple)) or not lines_node.elts:
+        return None
+    line_values = [_pricing_line_values(item) for item in lines_node.elts]
+    if any(value is None for value in line_values):
+        return None
+    subtotal = sum(value[0] * value[1] for value in line_values if value is not None)
+    currencies = {value[2] for value in line_values if value is not None}
+    shipping_node = _keyword_value(call, "shipping")
+    shipping_value = _money_value(shipping_node) if shipping_node else None
+    if len(currencies) != 1 or shipping_value is None or shipping_value[1] not in currencies:
+        return None
+    return subtotal, shipping_value[0], currencies.pop()
+
+
+def _shipping_due(discounted_subtotal: int, shipping: int) -> int:
+    """The documented USD tier table, expressed in minor units."""
+    if discounted_subtotal >= 35_000:
+        return 0
+    if discounted_subtotal >= 25_000:
+        return _round_half_up_minor(shipping, Decimal("0.75"))
+    if discounted_subtotal >= 15_000:
+        return _round_half_up_minor(shipping, Decimal("0.5"))
+    return shipping
+
+
+def _round_half_up_minor(amount: int, rate: Decimal) -> int:
+    return int((Decimal(amount) * rate).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def _pricing_line_values(node: ast.AST) -> tuple[int, int, str] | None:
@@ -258,16 +364,25 @@ def _string_constant(node: ast.AST) -> str | None:
 
 
 def _validate_claim_shape(proof: SilentOutputProof) -> None:
-    if proof.policy_id != _TAX_POLICY_ID:
-        raise ValueError(f"Unsupported silent-output policy: {proof.policy_id!r}.")
-    if proof.contract_path != _TAX_CONTRACT_PATH:
-        raise ValueError(f"Policy {_TAX_POLICY_ID!r} must cite {_TAX_CONTRACT_PATH!r}.")
-    if _normalize(proof.contract_anchor) != _normalize(_TAX_CONTRACT_ANCHOR):
-        raise ValueError("Candidate contract anchor does not exactly identify the supported repository policy.")
     if _duplicate_names(proof.input_values) or _duplicate_names(proof.expected_values):
         raise ValueError("Silent-output inputs and expected values must have unique names.")
-    if tuple(proof.observed_fields) != ("tax_minor", "total_minor"):
-        raise ValueError("The tax policy probe must observe tax_minor and total_minor in that order.")
+    if proof.policy_id == _TAX_POLICY_ID:
+        if proof.contract_path != _TAX_CONTRACT_PATH:
+            raise ValueError(f"Policy {_TAX_POLICY_ID!r} must cite {_TAX_CONTRACT_PATH!r}.")
+        if _normalize(proof.contract_anchor) != _normalize(_TAX_CONTRACT_ANCHOR):
+            raise ValueError("Candidate contract anchor does not exactly identify the supported repository policy.")
+        if tuple(proof.observed_fields) != ("tax_minor", "total_minor"):
+            raise ValueError("The tax policy probe must observe tax_minor and total_minor in that order.")
+        return
+    if proof.policy_id == _FREE_SHIPPING_POLICY_ID:
+        if proof.contract_path != _FREE_SHIPPING_CONTRACT_PATH:
+            raise ValueError(f"Policy {_FREE_SHIPPING_POLICY_ID!r} must cite {_FREE_SHIPPING_CONTRACT_PATH!r}.")
+        if _normalize(proof.contract_anchor) != _normalize(_FREE_SHIPPING_CONTRACT_ANCHOR):
+            raise ValueError("Candidate contract anchor does not exactly identify the supported repository policy.")
+        if tuple(proof.observed_fields) != ("shipping_minor", "total_minor"):
+            raise ValueError("The free-shipping probe must observe shipping_minor and total_minor in that order.")
+        return
+    raise ValueError(f"Unsupported silent-output policy: {proof.policy_id!r}.")
 
 
 def _read_contract(repo_root: Path, relative_path: str) -> str:
@@ -286,6 +401,8 @@ def _read_contract(repo_root: Path, relative_path: str) -> str:
 
 
 def _evaluate_supported_contract(proof: SilentOutputProof, content: str) -> tuple[MinorValue, ...]:
+    if proof.policy_id == _FREE_SHIPPING_POLICY_ID:
+        return _evaluate_free_shipping_contract(proof, content)
     if _normalize(_TAX_CONTRACT_ANCHOR) not in _normalize(content):
         raise ValueError("The cited source no longer contains the repository's post-discount tax contract.")
     values = {value.name: value.value for value in proof.input_values}
@@ -308,6 +425,31 @@ def _evaluate_supported_contract(proof: SilentOutputProof, content: str) -> tupl
     discounted = subtotal - discount
     tax = int((Decimal(discounted) * rate).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
     return (MinorValue("tax_minor", tax), MinorValue("total_minor", discounted + tax + shipping))
+
+
+def _evaluate_free_shipping_contract(proof: SilentOutputProof, content: str) -> tuple[MinorValue, ...]:
+    if _normalize(_FREE_SHIPPING_CONTRACT_ANCHOR) not in _normalize(content):
+        raise ValueError("The cited source no longer contains the repository's free-shipping tier contract.")
+    values = {value.name: value.value for value in proof.input_values}
+    if set(values) != {"subtotal_minor", "discount_minor", "shipping_minor", "tax_rate", "currency"}:
+        raise ValueError(
+            "Free-shipping inputs must be subtotal_minor, discount_minor, shipping_minor, tax_rate, and currency."
+        )
+    if {value.name for value in proof.expected_values} != {"shipping_minor", "total_minor"}:
+        raise ValueError("Free-shipping expected values must be shipping_minor and total_minor.")
+    try:
+        subtotal = int(values["subtotal_minor"])
+        discount = int(values["discount_minor"])
+        shipping = int(values["shipping_minor"])
+        tax_rate = Decimal(values["tax_rate"])
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError("Free-shipping inputs must contain integer minor amounts and a decimal tax rate.") from error
+    if values["currency"] != "USD":
+        raise ValueError("The documented free-shipping tiers are USD-only.")
+    if subtotal < 0 or discount != 0 or shipping < 0 or tax_rate != 0:
+        raise ValueError("Free-shipping proof supports a zero-tax, no-discount quote only.")
+    shipping_due = _shipping_due(subtotal, shipping)
+    return (MinorValue("shipping_minor", shipping_due), MinorValue("total_minor", subtotal + shipping_due))
 
 
 def _verify_probe_source(content: str, proof: SilentOutputProof) -> str | None:
